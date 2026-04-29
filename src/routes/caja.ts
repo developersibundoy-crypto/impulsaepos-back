@@ -49,7 +49,7 @@ router.get("/estado-actual", verifyTokenAndTenant, (req: any, res: any) => {
           SELECT monto as total_bruto, pago_efectivo as efectivo, pago_transferencia as transferencia, fecha_pago as fecha, cajero_id, empresa_id FROM abonos_separados
         ) AS todas_ventas
         WHERE empresa_id = ? 
-        ${cajero_id ? "AND cajero_id = ?" : "AND (cajero_id IS NULL OR cajero_id = 0)"}
+        ${cajero_id ? "AND cajero_id = ?" : ""}
         AND fecha >= ?
       `;
 
@@ -181,7 +181,7 @@ router.post("/cierre", verifyTokenAndTenant, (req: any, res: any) => {
           SELECT monto as total_bruto, pago_efectivo as efectivo, pago_transferencia as transferencia, fecha_pago as fecha, cajero_id, empresa_id FROM abonos_separados
         ) AS todas_ventas
         WHERE empresa_id = ? 
-        ${cajero_id ? "AND cajero_id = ?" : "AND (cajero_id IS NULL OR cajero_id = 0)"}
+        ${cajero_id ? "AND cajero_id = ?" : ""}
         AND fecha >= ?
       `;
 
