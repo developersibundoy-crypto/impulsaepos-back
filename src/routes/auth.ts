@@ -155,6 +155,7 @@ router.post("/login", (req: any, res: any) => {
       const hoy = new Date();
       const fecVen = new Date(admin.fecha_vencimiento_suscripcion);
 
+      /* 
       if (admin.role !== 'superadmin' && fecVen < hoy) {
         return res.status(403).json({
           error: "Suscripción Expirada",
@@ -162,6 +163,7 @@ router.post("/login", (req: any, res: any) => {
           empresa_id: admin.empresa_id
         });
       }
+      */
 
       if (!process.env.JWT_SECRET) {
         console.error("JWT_SECRET missing in ENV!");
