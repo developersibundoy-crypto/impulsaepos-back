@@ -12,7 +12,7 @@ router.use(verifyTokenAndTenant);
 router.get("/", (req: any, res: any) => {
   const empresa_id = req.user.empresa_id;
   const query = `
-    SELECT c.*, u.username, u.permisos 
+    SELECT c.*, u.username, u.permisos, u.id as usuario_id
     FROM cajeros c 
     LEFT JOIN usuarios_plataforma u ON c.id = u.cajero_id 
     WHERE c.empresa_id = ?

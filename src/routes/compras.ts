@@ -39,53 +39,55 @@ router.post("/", async (req: any, res: any) => {
   try {
     await conn.beginTransaction();
 
-    for (const p of productos) {
-      let finalId: number;
-      let stock_antes = 0;
+    if (!req.body.solo_registro) {
+      for (const p of productos) {
+        let finalId: number;
+        let stock_antes = 0;
 
-      // Buscar si el producto existe para sumar stock
-      let found = false;
-      if (p.referencia && p.referencia.trim() !== '') {
-        const [existing]: any = await conn.query(
-            "SELECT id, cantidad FROM productos WHERE referencia = ? AND empresa_id = ? FOR UPDATE", 
-            [p.referencia, empresa_id]
-        );
-        if (existing.length > 0) {
-          finalId = existing[0].id;
-          stock_antes = existing[0].cantidad;
-          found = true;
-          const esServicio = !!p.es_servicio;
-          const qUpdate = esServicio
-            ? "UPDATE productos SET precio_compra = ?, precio_venta = ?, porcentaje_ganancia = ?, es_servicio = 1 WHERE id = ? AND empresa_id = ?"
-            : "UPDATE productos SET cantidad = cantidad + ?, precio_compra = ?, precio_venta = ?, porcentaje_ganancia = ?, es_servicio = 0 WHERE id = ? AND empresa_id = ?";
-          
-          const params = esServicio 
-            ? [p.precio_compra, p.precio_venta, p.porcentaje_ganancia, finalId, empresa_id]
-            : [p.cantidad, p.precio_compra, p.precio_venta, p.porcentaje_ganancia, finalId, empresa_id];
+        // Buscar si el producto existe para sumar stock
+        let found = false;
+        if (p.referencia && p.referencia.trim() !== '') {
+          const [existing]: any = await conn.query(
+              "SELECT id, cantidad FROM productos WHERE referencia = ? AND empresa_id = ? FOR UPDATE", 
+              [p.referencia, empresa_id]
+          );
+          if (existing.length > 0) {
+            finalId = existing[0].id;
+            stock_antes = existing[0].cantidad;
+            found = true;
+            const esServicio = !!p.es_servicio;
+            const qUpdate = esServicio
+              ? "UPDATE productos SET precio_compra = ?, precio_venta = ?, porcentaje_ganancia = ?, es_servicio = 1 WHERE id = ? AND empresa_id = ?"
+              : "UPDATE productos SET cantidad = cantidad + ?, precio_compra = ?, precio_venta = ?, porcentaje_ganancia = ?, es_servicio = 0 WHERE id = ? AND empresa_id = ?";
+            
+            const params = esServicio 
+              ? [p.precio_compra, p.precio_venta, p.porcentaje_ganancia, finalId, empresa_id]
+              : [p.cantidad, p.precio_compra, p.precio_venta, p.porcentaje_ganancia, finalId, empresa_id];
 
-          await conn.query(qUpdate, params);
+            await conn.query(qUpdate, params);
+          }
         }
-      }
 
-      if (!found) {
-        // Crear nuevo producto
-        const [resIns]: any = await conn.query(
-          "INSERT INTO productos (empresa_id, referencia, nombre, categoria, cantidad, precio_compra, porcentaje_ganancia, precio_venta, es_servicio) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-          [empresa_id, p.referencia || '', p.nombre, p.categoria, p.cantidad, p.precio_compra, p.porcentaje_ganancia, p.precio_venta, p.es_servicio ? 1 : 0]
+        if (!found) {
+          // Crear nuevo producto
+          const [resIns]: any = await conn.query(
+            "INSERT INTO productos (empresa_id, referencia, nombre, categoria, cantidad, precio_compra, porcentaje_ganancia, precio_venta, es_servicio) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [empresa_id, p.referencia || '', p.nombre, p.categoria, p.cantidad, p.precio_compra, p.porcentaje_ganancia, p.precio_venta, p.es_servicio ? 1 : 0]
+          );
+          finalId = resIns.insertId;
+          stock_antes = 0;
+        }
+
+        // 3. Registrar Kardex
+        const esServicio = !!p.es_servicio;
+        const stock_despues = esServicio ? stock_antes : (stock_antes + p.cantidad);
+        const movType = esServicio ? 'COMPRA_SERVICIO' : 'ENTRADA';
+        
+        await conn.query(
+          "INSERT INTO kardex (producto_id, empresa_id, tipo_movimiento, cantidad_antes, cantidad_modificada, cantidad_despues, motivo, usuario_nombre, referencia) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          [finalId, empresa_id, movType, stock_antes, p.cantidad, stock_despues, `Compra Factura: ${proveedor || 'S/P'}`, usuario_nombre, `FC-${numero_factura || 'S/N'}`]
         );
-        finalId = resIns.insertId;
-        stock_antes = 0;
       }
-
-      // 3. Registrar Kardex
-      const esServicio = !!p.es_servicio;
-      const stock_despues = esServicio ? stock_antes : (stock_antes + p.cantidad);
-      const movType = esServicio ? 'COMPRA_SERVICIO' : 'ENTRADA';
-      
-      await conn.query(
-        "INSERT INTO kardex (producto_id, empresa_id, tipo_movimiento, cantidad_antes, cantidad_modificada, cantidad_despues, motivo, usuario_nombre, referencia) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        [finalId, empresa_id, movType, stock_antes, p.cantidad, stock_despues, `Compra Factura: ${proveedor || 'S/P'}`, usuario_nombre, `FC-${numero_factura || 'S/N'}`]
-      );
     }
     
     // 4. Registrar Factura

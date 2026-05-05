@@ -279,6 +279,10 @@ router.get("/reportes", verifyTokenAndTenant, (req: any, res: any) => {
     query += " AND s.usuario_id = ?";
     params.push(usuario_id);
   }
+  if (req.query.estado) {
+    query += " AND s.estado = ?";
+    params.push(req.query.estado);
+  }
 
   query += " ORDER BY s.fecha_apertura DESC";
 

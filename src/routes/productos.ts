@@ -485,6 +485,12 @@ router.post("/inyectar-stock", async (req: any, res: any) => {
     }
 
     await conn.commit();
+
+    // Notificación en tiempo real para que otros módulos (como Ventas/Separados) vean el nuevo stock
+    if (req.io) {
+      req.io.to(`empresa_${empresa_id}`).emit('inventory_batch_updated', { empresa_id });
+    }
+
     res.json({ success: true, message: "Stock inyectado correctamente." });
   } catch (err: any) {
     await conn.rollback();
