@@ -134,7 +134,7 @@ router.delete("/:id", verifyPermission("inventario"), async (req: any, res: any)
 
 router.get("/", (req: any, res: any) => {
   let queryEmpresaId = req.user.empresa_id;
-  const { tipo, page = 1, limit = 50, search = '' } = req.query;
+  const { tipo, page = 1, limit = 50, search = '', categoria = '' } = req.query;
   const offset = (parseInt(page as string) - 1) * parseInt(limit as string);
 
   let baseQuery = "SELECT * FROM productos WHERE empresa_id = ?";
@@ -155,6 +155,13 @@ router.get("/", (req: any, res: any) => {
     const clause = (baseQuery.includes('WHERE') ? " AND " : " WHERE ") + "es_servicio = 0";
     baseQuery += clause;
     countQuery += clause;
+  }
+
+  if (categoria) {
+    const categoryClause = " AND categoria = ?";
+    baseQuery += categoryClause;
+    countQuery += categoryClause;
+    params.push(categoria);
   }
 
   if (search) {
