@@ -217,4 +217,41 @@ router.post("/superadmin/config", verifySuperAdmin, (req: any, res: any) => {
   });
 });
 
+// Endpoint exclusivo Super Administrador: ACTIVACIÓN MANUAL (Para pagos en físico)
+router.post("/superadmin/activar-manual", verifySuperAdmin, (req: any, res: any) => {
+  const { empresa_id, dias, monto } = req.body;
+
+  if (!empresa_id || !dias) {
+    return res.status(400).json({ error: "Faltan datos requeridos (ID empresa o días)." });
+  }
+
+  // 1. Registrar el pago en el historial como 'MANUAL_SUPERADMIN'
+  const qPago = "INSERT INTO pagos_suscripcion (empresa_id, wompi_transaction_id, monto, dias_agregados) VALUES (?, ?, ?, ?)";
+  connection.query(qPago, [empresa_id, 'MANUAL_SUPERADMIN', monto || 0, dias], (err: any) => {
+    if (err) {
+      console.error("Error registrando pago manual:", err);
+      return res.status(500).json({ error: "Error técnico al registrar el pago manual." });
+    }
+    
+    // 2. Actualizar la fecha de vencimiento de la empresa
+    // Si ya está vencida, sumamos desde hoy. Si no, sumamos a la fecha actual de vencimiento.
+    const qActualizarSuscripcion = `
+      UPDATE empresas_suscritas 
+      SET estado = 'Active',
+      fecha_vencimiento_suscripcion = CASE 
+          WHEN fecha_vencimiento_suscripcion < CURRENT_DATE() THEN DATE_ADD(CURRENT_DATE(), INTERVAL ? DAY)
+          ELSE DATE_ADD(fecha_vencimiento_suscripcion, INTERVAL ? DAY)
+      END
+      WHERE id = ?
+    `;
+    connection.query(qActualizarSuscripcion, [dias, dias, empresa_id], (err2: any) => {
+       if(err2) {
+         console.error("Error actualizando vencimiento:", err2);
+         return res.status(500).json({ error: "Error actualizando la fecha de vencimiento." });
+       }
+       res.json({ success: true, message: `Activación manual de ${dias} días para la empresa #${empresa_id} completada exitosamente.` });
+    });
+  });
+});
+
 export default router;

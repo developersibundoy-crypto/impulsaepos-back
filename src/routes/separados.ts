@@ -73,7 +73,14 @@ router.post("/", async (req: any, res: any) => {
     // 1. Crear el registro del Separado (Privado por empresa_id)
     const [sepResult]: any = await conn.query(
       "INSERT INTO separados (empresa_id, cliente_id, cajero_id, total, saldo_pendiente, detalles_json, estado) VALUES (?, ?, ?, ?, ?, ?, 'Pendiente')",
-      [empresa_id, cliente_id, req.body.cajero_id || null, total, saldo_pendiente, JSON.stringify(detalles)]
+      [
+        empresa_id, 
+        cliente_id, 
+        req.body.cajero_id || null, 
+        total, 
+        saldo_pendiente, 
+        JSON.stringify(detalles)
+      ]
     );
     const separadoId = sepResult.insertId;
 
@@ -194,6 +201,109 @@ router.post("/:id/abonos", async (req: any, res: any) => {
 
   } catch (error: any) {
     await conn.rollback();
+    res.status(400).json({ error: error.message });
+  } finally {
+    conn.release();
+  }
+});
+
+// PUT update separado (Agregar más productos o modificar cantidades)
+router.put("/:id", async (req: any, res: any) => {
+  const empresa_id = req.user.empresa_id;
+  const { id } = req.params;
+  const { detalles, total } = req.body;
+
+  if (!detalles || total === undefined) {
+    return res.status(400).json({ error: "Faltan datos obligatorios: productos o total." });
+  }
+
+  const promisePool = pool.promise();
+  const conn = await promisePool.getConnection();
+
+  try {
+    await conn.beginTransaction();
+
+    // 1. Obtener el separado actual para comparar stock
+    const [sepResults]: any = await conn.query("SELECT * FROM separados WHERE id = ? AND empresa_id = ? FOR UPDATE", [id, empresa_id]);
+    if (sepResults.length === 0) throw new Error("Separado no encontrado");
+    const separado = sepResults[0];
+
+    if (separado.estado !== "Pendiente") throw new Error("No se puede editar un separado que no esté pendiente");
+
+    const oldDetalles = typeof separado.detalles_json === 'string' ? JSON.parse(separado.detalles_json) : separado.detalles_json;
+
+    // 2. Ajustar stock (Comparar old vs new por producto)
+    const allProductIds = new Set([
+      ...oldDetalles.map((p: any) => p.id),
+      ...detalles.map((p: any) => p.id)
+    ]);
+
+    for (const prodId of Array.from(allProductIds) as number[]) {
+      const oldItem = oldDetalles.find((p: any) => p.id === prodId);
+      const newItem = detalles.find((p: any) => p.id === prodId);
+
+      const oldQty = oldItem ? (oldItem.qty || oldItem.cantidad || 0) : 0;
+      const newQty = newItem ? (newItem.qty || newItem.cantidad || 0) : 0;
+
+      const delta = newQty - oldQty;
+
+      if (delta === 0) continue;
+
+      // Consultar stock actual
+      const [pData]: any = await conn.query(
+        "SELECT cantidad, es_servicio, nombre FROM productos WHERE id = ? AND empresa_id = ? FOR UPDATE", 
+        [prodId, empresa_id]
+      );
+
+      if (pData.length === 0) throw new Error(`El producto con ID ${prodId} no existe en su inventario.`);
+      const producto = pData[0];
+
+      if (!producto.es_servicio) {
+        if (delta > 0 && producto.cantidad < delta) {
+          throw new Error(`Stock insuficiente para "${producto.nombre}". Disponible: ${producto.cantidad}, Necesario adicional: ${delta}`);
+        }
+
+        // Actualizar stock
+        await conn.query(
+          "UPDATE productos SET cantidad = cantidad - ? WHERE id = ? AND empresa_id = ?", 
+          [delta, prodId, empresa_id]
+        );
+
+        // Registrar en Kardex
+        const tipoMov = delta > 0 ? 'SALIDA' : 'ENTRADA';
+        const cantMod = Math.abs(delta);
+
+        await conn.query(
+          "INSERT INTO kardex (producto_id, empresa_id, tipo_movimiento, cantidad_antes, cantidad_modificada, cantidad_despues, motivo, referencia) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+          [prodId, empresa_id, tipoMov, producto.cantidad, cantMod, producto.cantidad - delta, 'Edición de Separado (Ajuste)', `SEP-${id}`]
+        );
+      }
+    }
+
+    // 3. Recalcular saldo pendiente basado en el nuevo total y abonos previos
+    const [abonosRes]: any = await conn.query("SELECT SUM(monto) as total_abonos FROM abonos_separados WHERE separado_id = ? AND empresa_id = ?", [id, empresa_id]);
+    const totalAbonos = parseFloat(abonosRes[0].total_abonos) || 0;
+    const newSaldo = parseFloat(total) - totalAbonos;
+
+    if (newSaldo < 0) throw new Error("El nuevo total no puede ser inferior a los abonos ya realizados.");
+
+    // 4. Actualizar el registro
+    await conn.query(
+      "UPDATE separados SET total = ?, saldo_pendiente = ?, detalles_json = ? WHERE id = ? AND empresa_id = ?",
+      [total, newSaldo, JSON.stringify(detalles), id, empresa_id]
+    );
+
+    await conn.commit();
+    
+    if (req.io) {
+       req.io.to(`empresa_${empresa_id}`).emit('separado_updated', { id });
+    }
+
+    res.json({ success: true, message: "Separado actualizado y stock ajustado correctamente." });
+
+  } catch (error: any) {
+    await conn.rollback();
+    console.error("Error editando separado:", error);
     res.status(400).json({ error: error.message });
   } finally {
     conn.release();
