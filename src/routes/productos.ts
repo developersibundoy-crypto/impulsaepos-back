@@ -426,7 +426,7 @@ router.post("/inyectar-stock", async (req: any, res: any) => {
 
     for (const item of items) {
       const delta = parseFloat(item.delta) || 0;
-      if (delta <= 0) continue;
+      if (delta < 0) continue;
 
       let product_id: number | null = null;
       let stockAntes = 0;
@@ -449,46 +449,63 @@ router.post("/inyectar-stock", async (req: any, res: any) => {
       if (existing.length > 0) {
         product_id = existing[0].id;
         stockAntes = existing[0].cantidad;
-        // Actualizar stock
+        // Actualizar stock y toda la configuración del producto
         await conn.query(
-          "UPDATE productos SET cantidad = cantidad + ?, precio_compra = ?, precio_venta = ?, porcentaje_ganancia = ? WHERE id = ?",
-          [delta, item.precio_compra, item.precio_venta, item.porcentaje_ganancia, product_id]
-        );
-      } else {
-        // Crear producto nuevo si no existe
-        const [result]: any = await conn.query(
-          "INSERT INTO productos (empresa_id, referencia, nombre, categoria, cantidad, precio_compra, porcentaje_ganancia, precio_venta, es_servicio, permitir_venta_negativa, iva_porcentaje, fecha_vencimiento) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          "UPDATE productos SET cantidad = cantidad + ?, precio_compra = ?, precio_venta = ?, porcentaje_ganancia = ?, nombre = ?, categoria = ?, es_servicio = ?, permitir_venta_negativa = ?, iva_porcentaje = ?, fecha_vencimiento = ? WHERE id = ? AND empresa_id = ?",
           [
-            empresa_id, 
-            item.referencia || '', 
-            item.nombre, 
-            item.categoria, 
             delta, 
             item.precio_compra, 
-            item.porcentaje_ganancia, 
             item.precio_venta, 
-            item.es_servicio ? 1 : 0, 
+            item.porcentaje_ganancia, 
+            item.nombre,
+            item.categoria,
+            item.es_servicio ? 1 : 0,
             item.permitir_venta_negativa !== undefined ? (item.permitir_venta_negativa ? 1 : 0) : 1,
             item.iva_porcentaje || 0,
-            item.fecha_vencimiento || null
+            item.fecha_vencimiento || null,
+            product_id,
+            empresa_id
           ]
         );
-        product_id = result.insertId;
+      } else {
+        // Crear producto nuevo si no existe (solo si delta > 0)
+        if (delta > 0) {
+          const [result]: any = await conn.query(
+            "INSERT INTO productos (empresa_id, referencia, nombre, categoria, cantidad, precio_compra, porcentaje_ganancia, precio_venta, es_servicio, permitir_venta_negativa, iva_porcentaje, fecha_vencimiento) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+              empresa_id, 
+              item.referencia || '', 
+              item.nombre, 
+              item.categoria, 
+              delta, 
+              item.precio_compra, 
+              item.porcentaje_ganancia, 
+              item.precio_venta, 
+              item.es_servicio ? 1 : 0, 
+              item.permitir_venta_negativa !== undefined ? (item.permitir_venta_negativa ? 1 : 0) : 1,
+              item.iva_porcentaje || 0,
+              item.fecha_vencimiento || null
+            ]
+          );
+          product_id = result.insertId;
+        }
       }
 
-      // 2. Registrar en Kardex
-      await conn.query(
-        "INSERT INTO kardex (producto_id, empresa_id, tipo_movimiento, cantidad_antes, cantidad_modificada, cantidad_despues, motivo, usuario_nombre, referencia) VALUES (?, ?, 'ENTRADA_BORRADOR', ?, ?, ?, 'Inyección incremental desde borrador', ?, ?)",
-        [
-          product_id, 
-          empresa_id, 
-          stockAntes, 
-          delta, 
-          stockAntes + delta, 
-          req.user.username || 'Sistema', 
-          item.referencia || 'S/REF'
-        ]
-      );
+      // 2. Registrar en Kardex (solo si hay movimiento de inventario, es decir delta > 0)
+      if (product_id && delta > 0) {
+        await conn.query(
+          "INSERT INTO kardex (producto_id, empresa_id, tipo_movimiento, cantidad_antes, cantidad_modificada, cantidad_despues, motivo, usuario_nombre, referencia) VALUES (?, ?, 'ENTRADA_BORRADOR', ?, ?, ?, 'Inyección incremental desde borrador', ?, ?)",
+          [
+            product_id, 
+            empresa_id, 
+            stockAntes, 
+            delta, 
+            stockAntes + delta, 
+            req.user.username || 'Sistema', 
+            item.referencia || 'S/REF'
+          ]
+        );
+      }
     }
 
     await conn.commit();
