@@ -268,12 +268,12 @@ router.get("/reportes", verifyTokenAndTenant, (req: any, res: any) => {
   const params: any[] = [empresa_id];
 
   if (desde) {
-    query += " AND s.fecha_apertura >= ?";
-    params.push(desde);
+    query += " AND (s.fecha_cierre >= ? OR s.estado = 'Abierta')";
+    params.push(`${desde} 00:00:00`);
   }
   if (hasta) {
     query += " AND s.fecha_apertura <= ?";
-    params.push(hasta);
+    params.push(`${hasta} 23:59:59`);
   }
   if (usuario_id) {
     query += " AND s.usuario_id = ?";

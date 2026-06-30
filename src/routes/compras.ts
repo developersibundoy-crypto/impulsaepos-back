@@ -91,8 +91,30 @@ router.post("/", async (req: any, res: any) => {
     }
     
     // 4. Registrar Factura
-    const insertQuery = "INSERT INTO facturas_compra (empresa_id, proveedor, numero_factura, total, datos_json) VALUES (?, ?, ?, ?, ?)";
-    const [result]: any = await conn.query(insertQuery, [empresa_id, proveedor || '', numero_factura || '', total || 0, JSON.stringify(productos)]);
+    const archivo_factura = req.body.archivo_factura || null;
+    const insertQuery = "INSERT INTO facturas_compra (empresa_id, proveedor, numero_factura, total, datos_json, archivo_factura) VALUES (?, ?, ?, ?, ?, ?)";
+    const [result]: any = await conn.query(insertQuery, [empresa_id, proveedor || '', numero_factura || '', total || 0, JSON.stringify(productos), archivo_factura]);
+    const facturaCompraId = result.insertId;
+
+    // --- NUEVO: Automatización Cuentas por Pagar (CxP) ---
+    if (req.body.es_credito) {
+      const montoAbonado = parseFloat(req.body.monto_abonado) || 0;
+      const totalCompra = parseFloat(total) || 0;
+      const saldoPdte = Math.max(0, totalCompra - montoAbonado);
+      
+      const [resCxp]: any = await conn.query(
+        "INSERT INTO cuentas_por_pagar (empresa_id, factura_compra_id, proveedor, numero_factura, monto_total, saldo_pendiente, estado) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        [empresa_id, facturaCompraId, proveedor || 'Desconocido', numero_factura || 'N/A', totalCompra, saldoPdte, saldoPdte === 0 ? 'Pagada' : 'Pendiente']
+      );
+
+      if (montoAbonado > 0) {
+        await conn.query(
+          "INSERT INTO abonos_cxp (empresa_id, cxp_id, monto, metodo_pago) VALUES (?, ?, ?, ?)",
+          [empresa_id, resCxp.insertId, montoAbonado, req.body.metodo_pago_abono || 'Efectivo']
+        );
+      }
+    }
+    // -----------------------------------------------------
 
     await conn.commit();
     res.status(201).json({ message: "Compra registrada y stock actualizado con trazabilidad.", id: result.insertId });

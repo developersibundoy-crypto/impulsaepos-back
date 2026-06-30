@@ -56,6 +56,19 @@ router.post("/", verifyPermission("venta"), async (req: any, res: any) => {
     );
     const facturaId = resCab.insertId;
 
+    // --- NUEVO: Automatización Cuentas por Cobrar (CxC) ---
+    const totalPagado = pef + ptr;
+    const saldoPendiente = Math.round((totalVal - totalPagado) * 100) / 100;
+    
+    if ((metodoPago === 'Credito' || saldoPendiente > 0) && clId) {
+      const saldoFinal = saldoPendiente > 0 ? saldoPendiente : totalVal;
+      await conn.query(
+        "INSERT INTO cuentas_por_cobrar (empresa_id, factura_venta_id, cliente_id, monto_total, saldo_pendiente, estado) VALUES (?, ?, ?, ?, ?, ?)",
+        [empresa_id, facturaId, clId, totalVal, saldoFinal, 'Pendiente']
+      );
+    }
+    // --------------------------------------------------------
+
     // 2. Insertar Detalles y Actualizar Inventario
     for (const item of items) {
       if (!item.id || !item.qty) {
@@ -142,14 +155,120 @@ router.get("/", verifyPermission("facturas_venta"), (req: any, res: any) => {
   const offset = (page - 1) * limit;
   const search = req.query.search as string || "";
   const filtro = req.query.filtro as string || "Todas";
+  const tipo_factura = req.query.tipo_factura as string || "Todas";
 
-  let whereClause = "WHERE f.empresa_id = ?";
-  const queryParams: any[] = [empresa_id];
+  let fromClause = "";
+  const queryParams: any[] = [];
+
+  if (tipo_factura === "POS") {
+    fromClause = `
+      (
+        SELECT 
+          fv.id,
+          fv.fecha,
+          fv.total,
+          fv.iva,
+          fv.metodo_pago,
+          fv.pago_efectivo,
+          fv.pago_transferencia,
+          fv.cliente_id,
+          'POS' AS tipo_factura,
+          NULL AS prefijo,
+          NULL AS consecutivo,
+          c.nombre AS cajero,
+          cl.nombre AS cliente,
+          cl.telefono,
+          fv.empresa_id
+        FROM facturas_venta fv
+        LEFT JOIN cajeros c ON fv.cajero_id = c.id
+        LEFT JOIN clientes cl ON fv.cliente_id = cl.id
+        WHERE fv.empresa_id = ?
+      ) f
+    `;
+    queryParams.push(empresa_id);
+  } else if (tipo_factura === "ELECTRONICA") {
+    fromClause = `
+      (
+        SELECT 
+          fe.id,
+          fe.fecha_emision AS fecha,
+          fe.total,
+          fe.iva,
+          fe.metodo_pago,
+          fe.pago_efectivo,
+          fe.pago_transferencia,
+          fe.cliente_id,
+          'ELECTRONICA' AS tipo_factura,
+          fe.prefijo,
+          fe.consecutivo,
+          c.nombre AS cajero,
+          cl.nombre AS cliente,
+          cl.telefono,
+          fe.empresa_id
+        FROM facturas_electronicas fe
+        LEFT JOIN cajeros c ON fe.cajero_id = c.id
+        LEFT JOIN clientes cl ON fe.cliente_id = cl.id
+        WHERE fe.empresa_id = ?
+      ) f
+    `;
+    queryParams.push(empresa_id);
+  } else {
+    fromClause = `
+      (
+        SELECT 
+          fv.id,
+          fv.fecha,
+          fv.total,
+          fv.iva,
+          fv.metodo_pago,
+          fv.pago_efectivo,
+          fv.pago_transferencia,
+          fv.cliente_id,
+          'POS' AS tipo_factura,
+          NULL AS prefijo,
+          NULL AS consecutivo,
+          c.nombre AS cajero,
+          cl.nombre AS cliente,
+          cl.telefono,
+          fv.empresa_id
+        FROM facturas_venta fv
+        LEFT JOIN cajeros c ON fv.cajero_id = c.id
+        LEFT JOIN clientes cl ON fv.cliente_id = cl.id
+        WHERE fv.empresa_id = ?
+
+        UNION ALL
+
+        SELECT 
+          fe.id,
+          fe.fecha_emision AS fecha,
+          fe.total,
+          fe.iva,
+          fe.metodo_pago,
+          fe.pago_efectivo,
+          fe.pago_transferencia,
+          fe.cliente_id,
+          'ELECTRONICA' AS tipo_factura,
+          fe.prefijo,
+          fe.consecutivo,
+          c.nombre AS cajero,
+          cl.nombre AS cliente,
+          cl.telefono,
+          fe.empresa_id
+        FROM facturas_electronicas fe
+        LEFT JOIN cajeros c ON fe.cajero_id = c.id
+        LEFT JOIN clientes cl ON fe.cliente_id = cl.id
+        WHERE fe.empresa_id = ?
+      ) f
+    `;
+    queryParams.push(empresa_id, empresa_id);
+  }
+
+  let whereClause = "WHERE 1=1";
 
   if (search) {
-    whereClause += " AND (cl.nombre LIKE ? OR f.id LIKE ?)";
+    whereClause += " AND (f.cliente LIKE ? OR CAST(f.id AS CHAR) LIKE ? OR CONCAT(COALESCE(f.prefijo, ''), COALESCE(f.consecutivo, '')) LIKE ? OR f.cajero LIKE ?)";
     const searchPattern = `%${search}%`;
-    queryParams.push(searchPattern, searchPattern);
+    queryParams.push(searchPattern, searchPattern, searchPattern, searchPattern);
   }
 
   if (filtro === "Efectivo") {
@@ -160,16 +279,13 @@ router.get("/", verifyPermission("facturas_venta"), (req: any, res: any) => {
 
   const countQuery = `
     SELECT COUNT(*) as total 
-    FROM facturas_venta f
-    LEFT JOIN clientes cl ON f.cliente_id = cl.id
+    FROM ${fromClause}
     ${whereClause}
   `;
 
   const dataQuery = `
-    SELECT f.id, f.fecha, f.total, f.iva, f.metodo_pago, f.pago_efectivo, f.pago_transferencia, f.cliente_id, c.nombre AS cajero, cl.nombre AS cliente, cl.telefono 
-    FROM facturas_venta f
-    LEFT JOIN cajeros c ON f.cajero_id = c.id
-    LEFT JOIN clientes cl ON f.cliente_id = cl.id
+    SELECT f.*
+    FROM ${fromClause}
     ${whereClause}
     ORDER BY f.fecha DESC
     LIMIT ? OFFSET ?
@@ -193,22 +309,39 @@ router.get("/", verifyPermission("facturas_venta"), (req: any, res: any) => {
 
 router.get("/:id", (req: any, res: any) => {
   const empresa_id = req.user.empresa_id;
-  const query = `
-    SELECT v.cantidad, v.precio_unitario, p.nombre, p.referencia 
-    FROM ventas v
-    JOIN productos p ON v.producto_id = p.id
-    WHERE v.factura_id = ? AND v.empresa_id = ?
-  `;
-  pool.query(query, [req.params.id, empresa_id], (err: any, results: any) => {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json(results);
-  });
+  const tipo = req.query.tipo as string;
+
+  if (tipo === "ELECTRONICA") {
+    const query = `
+      SELECT v.cantidad, v.precio_unitario, p.nombre, p.referencia 
+      FROM ventas_electronicas v
+      JOIN facturas_electronicas fe ON v.factura_electronica_id = fe.id
+      JOIN productos p ON v.producto_id = p.id
+      WHERE v.factura_electronica_id = ? AND fe.empresa_id = ?
+    `;
+    pool.query(query, [req.params.id, empresa_id], (err: any, results: any) => {
+      if (err) return res.status(500).json({ error: err.message });
+      res.json(results);
+    });
+  } else {
+    const query = `
+      SELECT v.cantidad, v.precio_unitario, p.nombre, p.referencia 
+      FROM ventas v
+      JOIN productos p ON v.producto_id = p.id
+      WHERE v.factura_id = ? AND v.empresa_id = ?
+    `;
+    pool.query(query, [req.params.id, empresa_id], (err: any, results: any) => {
+      if (err) return res.status(500).json({ error: err.message });
+      res.json(results);
+    });
+  }
 });
 
 // Anular factura - Requiere permiso de facturas_venta
 router.delete("/:id", verifyPermission("facturas_venta"), async (req: any, res: any) => {
   const empresa_id = req.user.empresa_id;
   const facturaId = req.params.id;
+  const tipo = req.query.tipo as string;
   const { motivo_anulacion, usuario_nombre } = req.body || {};
   const auditor_nombre = usuario_nombre || req.user.username || 'System';
 
@@ -218,51 +351,88 @@ router.delete("/:id", verifyPermission("facturas_venta"), async (req: any, res: 
   try {
     await conn.beginTransaction();
 
-    // 1. Obtener los ítems de la venta para devolver stock
-    const [items]: any = await conn.query(
-      "SELECT producto_id, cantidad FROM ventas WHERE factura_id = ? AND empresa_id = ? FOR UPDATE", 
-      [facturaId, empresa_id]
-    );
+    if (tipo === "ELECTRONICA") {
+      // 1. Obtener los ítems de la venta para devolver stock (Electrónica)
+      const [items]: any = await conn.query(
+        "SELECT producto_id, cantidad FROM ventas_electronicas v JOIN facturas_electronicas fe ON v.factura_electronica_id = fe.id WHERE v.factura_electronica_id = ? AND fe.empresa_id = ? FOR UPDATE", 
+        [facturaId, empresa_id]
+      );
 
-    if (items.length > 0) {
-      for (const item of items) {
-        // Consultar tipo de producto (bloqueado para evitar colisiones)
-        const [pData]: any = await conn.query("SELECT es_servicio, cantidad FROM productos WHERE id = ? FOR UPDATE", [item.producto_id]);
-        
-        if (pData.length > 0) {
-          const esServicio = !!pData[0].es_servicio;
-          const stock_antes = pData[0].cantidad;
+      if (items.length > 0) {
+        for (const item of items) {
+          // Consultar tipo de producto (bloqueado para evitar colisiones)
+          const [pData]: any = await conn.query("SELECT es_servicio, cantidad FROM productos WHERE id = ? FOR UPDATE", [item.producto_id]);
+          
+          if (pData.length > 0) {
+            const esServicio = !!pData[0].es_servicio;
+            const stock_antes = pData[0].cantidad;
 
-          if (!esServicio) {
-            // Revertir stock solo si era producto físico
-            await conn.query("UPDATE productos SET cantidad = cantidad + ? WHERE id = ? AND empresa_id = ?", [item.cantidad, item.producto_id, empresa_id]);
+            if (!esServicio) {
+              // Revertir stock solo si era producto físico
+              await conn.query("UPDATE productos SET cantidad = cantidad + ? WHERE id = ? AND empresa_id = ?", [item.cantidad, item.producto_id, empresa_id]);
+            }
+
+            // Registrar en Kardex la anulación para trazabilidad
+            const stock_despues = esServicio ? stock_antes : (stock_antes + item.cantidad);
+            const movType = esServicio ? 'ANULACIÓN_SERVICIO' : 'ANULACIÓN';
+            await conn.query(
+              "INSERT INTO kardex (producto_id, empresa_id, tipo_movimiento, cantidad_antes, cantidad_modificada, cantidad_despues, motivo, usuario_nombre, referencia) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              [item.producto_id, empresa_id, movType, stock_antes, item.cantidad, stock_despues, `Anulación: ${motivo_anulacion || 'Sin motivo'}`, auditor_nombre, `FE-${facturaId}-ANUL`]
+            );
           }
-
-          // Registrar en Kardex la anulación para trazabilidad
-          // Si era servicio, el stock no cambia
-          const stock_despues = esServicio ? stock_antes : (stock_antes + item.cantidad);
-          const movType = esServicio ? 'ANULACIÓN_SERVICIO' : 'ANULACIÓN';
-          await conn.query(
-            "INSERT INTO kardex (producto_id, empresa_id, tipo_movimiento, cantidad_antes, cantidad_modificada, cantidad_despues, motivo, usuario_nombre, referencia) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            [item.producto_id, empresa_id, movType, stock_antes, item.cantidad, stock_despues, `Anulación: ${motivo_anulacion || 'Sin motivo'}`, auditor_nombre, `F-${facturaId}-ANUL`]
-          );
         }
       }
-    }
 
-    // 2. Eliminar detalles y cabecera
-    await conn.query("DELETE FROM ventas WHERE factura_id = ? AND empresa_id = ?", [facturaId, empresa_id]);
-    await conn.query("DELETE FROM facturas_venta WHERE id = ? AND empresa_id = ?", [facturaId, empresa_id]);
+      // 2. Eliminar detalles y cabecera (Electrónica)
+      await conn.query("DELETE FROM ventas_electronicas WHERE factura_electronica_id = ?", [facturaId]);
+      await conn.query("DELETE FROM facturas_electronicas WHERE id = ? AND empresa_id = ?", [facturaId, empresa_id]);
+
+    } else {
+      // 1. Obtener los ítems de la venta para devolver stock (POS)
+      const [items]: any = await conn.query(
+        "SELECT producto_id, cantidad FROM ventas WHERE factura_id = ? AND empresa_id = ? FOR UPDATE", 
+        [facturaId, empresa_id]
+      );
+
+      if (items.length > 0) {
+        for (const item of items) {
+          // Consultar tipo de producto (bloqueado para evitar colisiones)
+          const [pData]: any = await conn.query("SELECT es_servicio, cantidad FROM productos WHERE id = ? FOR UPDATE", [item.producto_id]);
+          
+          if (pData.length > 0) {
+            const esServicio = !!pData[0].es_servicio;
+            const stock_antes = pData[0].cantidad;
+
+            if (!esServicio) {
+              // Revertir stock solo si era producto físico
+              await conn.query("UPDATE productos SET cantidad = cantidad + ? WHERE id = ? AND empresa_id = ?", [item.cantidad, item.producto_id, empresa_id]);
+            }
+
+            // Registrar en Kardex la anulación para trazabilidad
+            const stock_despues = esServicio ? stock_antes : (stock_antes + item.cantidad);
+            const movType = esServicio ? 'ANULACIÓN_SERVICIO' : 'ANULACIÓN';
+            await conn.query(
+              "INSERT INTO kardex (producto_id, empresa_id, tipo_movimiento, cantidad_antes, cantidad_modificada, cantidad_despues, motivo, usuario_nombre, referencia) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              [item.producto_id, empresa_id, movType, stock_antes, item.cantidad, stock_despues, `Anulación: ${motivo_anulacion || 'Sin motivo'}`, auditor_nombre, `F-${facturaId}-ANUL`]
+            );
+          }
+        }
+      }
+
+      // 2. Eliminar detalles y cabecera (POS)
+      await conn.query("DELETE FROM ventas WHERE factura_id = ? AND empresa_id = ?", [facturaId, empresa_id]);
+      await conn.query("DELETE FROM facturas_venta WHERE id = ? AND empresa_id = ?", [facturaId, empresa_id]);
+    }
 
     await conn.commit();
     res.json({ success: true, message: "Factura anulada y stock devuelto con trazabilidad en Kardex." });
 
   } catch (error: any) {
-    await conn.rollback();
+    if (conn) await conn.rollback();
     console.error("Error al anular factura:", error);
     res.status(500).json({ error: "No se pudo anular la factura: " + error.message });
   } finally {
-    conn.release();
+    if (conn) conn.release();
   }
 });
 

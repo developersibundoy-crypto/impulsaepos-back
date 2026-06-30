@@ -9,7 +9,7 @@ router.use(verifyTokenAndTenant);
 
 router.get("/dashboard", (req: any, res: any) => {
   const empresa_id = req.user.empresa_id;
-  const { cajeroId, categoria, startDate, endDate, es_servicio } = req.query;
+  const { cajeroId, categoria, startDate, endDate, es_servicio, tipo_factura } = req.query;
 
   const reportes: {
     general: any;
@@ -47,6 +47,11 @@ router.get("/dashboard", (req: any, res: any) => {
     whereClauses.push("f.fecha <= ?");
     params.push(`${endDate} 23:59:59`);
   }
+  if (tipo_factura === "POS") {
+    whereClauses.push("f.tipo_factura = 'POS'");
+  } else if (tipo_factura === "ELECTRONICA") {
+    whereClauses.push("f.tipo_factura = 'ELECTRONICA'");
+  }
 
   const whereSQL = whereClauses.join(" AND ");
 
@@ -55,26 +60,43 @@ router.get("/dashboard", (req: any, res: any) => {
       COALESCE(SUM(factura_total), 0) as total_ingresos, 
       COALESCE(SUM(factura_utilidad), 0) as total_utilidad_global,
       COALESCE(SUM(factura_iva), 0) as total_iva,
-      COUNT(DISTINCT factura_id) as total_ventas 
+      COUNT(DISTINCT CONCAT(tipo_factura, '-', factura_id)) as total_ventas 
     FROM (
       SELECT 
         f.id as factura_id,
+        f.tipo_factura,
         f.iva as factura_iva,
         SUM(v.cantidad * v.precio_unitario) as factura_total,
         SUM(v.cantidad * (v.precio_unitario - COALESCE(NULLIF(v.costo_unitario, 0), p.precio_compra, 0))) as factura_utilidad
-      FROM facturas_venta f
-      LEFT JOIN ventas v ON f.id = v.factura_id
+      FROM (
+        SELECT id, fecha, empresa_id, cajero_id, cliente_id, metodo_pago, iva, 'POS' AS tipo_factura FROM facturas_venta
+        UNION ALL
+        SELECT id, fecha_emision AS fecha, empresa_id, cajero_id, cliente_id, metodo_pago, iva, 'ELECTRONICA' AS tipo_factura FROM facturas_electronicas
+      ) f
+      LEFT JOIN (
+        SELECT factura_id, producto_id, cantidad, precio_unitario, costo_unitario, 'POS' AS tipo_factura FROM ventas
+        UNION ALL
+        SELECT factura_electronica_id AS factura_id, producto_id, cantidad, precio_unitario, 0 AS costo_unitario, 'ELECTRONICA' AS tipo_factura FROM ventas_electronicas
+      ) v ON f.id = v.factura_id AND f.tipo_factura = v.tipo_factura
       LEFT JOIN productos p ON v.producto_id = p.id
       WHERE ${whereSQL}
-      GROUP BY f.id
+      GROUP BY f.tipo_factura, f.id
     ) as sub
   `;
-  
+
   // Q2: TOP PRODUCTOS
   const q2 = `
     SELECT p.nombre, p.categoria, SUM(v.cantidad) as total_vendido 
-    FROM facturas_venta f
-    JOIN ventas v ON f.id = v.factura_id
+    FROM (
+      SELECT id, fecha, empresa_id, cajero_id, cliente_id, 'POS' AS tipo_factura FROM facturas_venta
+      UNION ALL
+      SELECT id, fecha_emision AS fecha, empresa_id, cajero_id, cliente_id, 'ELECTRONICA' AS tipo_factura FROM facturas_electronicas
+    ) f
+    JOIN (
+      SELECT factura_id, producto_id, cantidad, 'POS' AS tipo_factura FROM ventas
+      UNION ALL
+      SELECT factura_electronica_id AS factura_id, producto_id, cantidad, 'ELECTRONICA' AS tipo_factura FROM ventas_electronicas
+    ) v ON f.id = v.factura_id AND f.tipo_factura = v.tipo_factura
     JOIN productos p ON v.producto_id = p.id
     WHERE ${whereSQL}
     GROUP BY p.id
@@ -102,19 +124,32 @@ router.get("/dashboard", (req: any, res: any) => {
     q3WhereClauses.push("p.categoria = ?");
     q3Params.push(categoria);
   }
+  if (tipo_factura === "POS") {
+    q3WhereClauses.push("f.tipo_factura = 'POS'");
+  } else if (tipo_factura === "ELECTRONICA") {
+    q3WhereClauses.push("f.tipo_factura = 'ELECTRONICA'");
+  }
 
   const q3Where = q3WhereClauses.join(" AND ");
 
   const q3 = `
     SELECT c.nombre, 
-           COUNT(DISTINCT f.id) as cantidad_facturas, 
+           COUNT(DISTINCT CONCAT(f.tipo_factura, '-', f.id)) as cantidad_facturas, 
            COALESCE(SUM(v.cantidad * v.precio_unitario), 0) as dinero_recaudado,
            COALESCE(SUM(CASE WHEN f.metodo_pago = 'Efectivo' THEN (v.cantidad * v.precio_unitario) WHEN f.metodo_pago = 'Mixto' THEN (f.pago_efectivo * (v.cantidad * v.precio_unitario / NULLIF(f.total, 0))) ELSE 0 END), 0) as dinero_efectivo,
            COALESCE(SUM(CASE WHEN f.metodo_pago IN ('Tarjeta', 'Transferencia') THEN (v.cantidad * v.precio_unitario) WHEN f.metodo_pago = 'Mixto' THEN (f.pago_transferencia * (v.cantidad * v.precio_unitario / NULLIF(f.total, 0))) ELSE 0 END), 0) as dinero_transferencia,
            COALESCE(SUM(v.cantidad * (v.precio_unitario - COALESCE(NULLIF(v.costo_unitario, 0), p.precio_compra, 0))), 0) as total_utilidad
     FROM cajeros c
-    JOIN facturas_venta f ON c.id = f.cajero_id
-    JOIN ventas v ON f.id = v.factura_id
+    JOIN (
+      SELECT id, fecha, empresa_id, cajero_id, cliente_id, total, metodo_pago, pago_efectivo, pago_transferencia, 'POS' AS tipo_factura FROM facturas_venta
+      UNION ALL
+      SELECT id, fecha_emision AS fecha, empresa_id, cajero_id, cliente_id, total, metodo_pago, pago_efectivo, pago_transferencia, 'ELECTRONICA' AS tipo_factura FROM facturas_electronicas
+    ) f ON c.id = f.cajero_id
+    JOIN (
+      SELECT factura_id, producto_id, cantidad, precio_unitario, costo_unitario, 'POS' AS tipo_factura FROM ventas
+      UNION ALL
+      SELECT factura_electronica_id AS factura_id, producto_id, cantidad, precio_unitario, 0 AS costo_unitario, 'ELECTRONICA' AS tipo_factura FROM ventas_electronicas
+    ) v ON f.id = v.factura_id AND f.tipo_factura = v.tipo_factura
     JOIN productos p ON v.producto_id = p.id
     WHERE ${q3Where}
     GROUP BY c.id
@@ -127,8 +162,16 @@ router.get("/dashboard", (req: any, res: any) => {
       p.categoria, 
       COALESCE(SUM(v.cantidad * v.precio_unitario), 0) as total_recaudado,
       COALESCE(SUM(v.cantidad * (v.precio_unitario - COALESCE(NULLIF(v.costo_unitario, 0), p.precio_compra, 0))), 0) as total_utilidad
-    FROM facturas_venta f
-    JOIN ventas v ON f.id = v.factura_id
+    FROM (
+      SELECT id, fecha, empresa_id, cajero_id, cliente_id, 'POS' AS tipo_factura FROM facturas_venta
+      UNION ALL
+      SELECT id, fecha_emision AS fecha, empresa_id, cajero_id, cliente_id, 'ELECTRONICA' AS tipo_factura FROM facturas_electronicas
+    ) f
+    JOIN (
+      SELECT factura_id, producto_id, cantidad, precio_unitario, costo_unitario, 'POS' AS tipo_factura FROM ventas
+      UNION ALL
+      SELECT factura_electronica_id AS factura_id, producto_id, cantidad, precio_unitario, 0 AS costo_unitario, 'ELECTRONICA' AS tipo_factura FROM ventas_electronicas
+    ) v ON f.id = v.factura_id AND f.tipo_factura = v.tipo_factura
     JOIN productos p ON v.producto_id = p.id
     WHERE ${whereSQL}
     GROUP BY p.categoria
@@ -150,23 +193,23 @@ router.get("/dashboard", (req: any, res: any) => {
     runQuery(q3, q3Params),
     runQuery(q4, params)
   ])
-  .then(([res1, res2, res3, res4]: any) => {
-    reportes.general = res1[0];
-    reportes.topProductos = res2;
-    reportes.rendimientoCajeros = res3;
-    reportes.ingresosCategorias = res4;
-    res.json(reportes);
-  })
-  .catch(err => {
-    console.error("Analytics Error:", err);
-    res.status(500).json({ error: "Error procesando analíticas" });
-  });
+    .then(([res1, res2, res3, res4]: any) => {
+      reportes.general = res1[0];
+      reportes.topProductos = res2;
+      reportes.rendimientoCajeros = res3;
+      reportes.ingresosCategorias = res4;
+      res.json(reportes);
+    })
+    .catch(err => {
+      console.error("Analytics Error:", err);
+      res.status(500).json({ error: "Error procesando analíticas" });
+    });
 });
 
 // --- NUEVO: OBTENER CATEGORÍAS QUE TIENEN VENTAS REGISTRADAS ---
 router.get("/categorias-vendidas", (req: any, res: any) => {
   const empresa_id = req.user.empresa_id;
-  const { cajeroId, startDate, endDate, es_servicio } = req.query;
+  const { cajeroId, startDate, endDate, es_servicio, tipo_factura } = req.query;
 
   let whereClauses = ["f.empresa_id = ?"];
   let params: any[] = [empresa_id];
@@ -187,14 +230,27 @@ router.get("/categorias-vendidas", (req: any, res: any) => {
     whereClauses.push("f.fecha <= ?");
     params.push(`${endDate} 23:59:59`);
   }
+  if (tipo_factura === "POS") {
+    whereClauses.push("f.tipo_factura = 'POS'");
+  } else if (tipo_factura === "ELECTRONICA") {
+    whereClauses.push("f.tipo_factura = 'ELECTRONICA'");
+  }
 
   const whereSQL = whereClauses.join(" AND ");
 
   const query = `
     SELECT DISTINCT p.categoria
     FROM productos p
-    JOIN ventas v ON p.id = v.producto_id
-    JOIN facturas_venta f ON v.factura_id = f.id
+    JOIN (
+      SELECT factura_id, producto_id, 'POS' AS tipo_factura FROM ventas
+      UNION ALL
+      SELECT factura_electronica_id AS factura_id, producto_id, 'ELECTRONICA' AS tipo_factura FROM ventas_electronicas
+    ) v ON p.id = v.producto_id
+    JOIN (
+      SELECT id, fecha, empresa_id, cajero_id, 'POS' AS tipo_factura FROM facturas_venta
+      UNION ALL
+      SELECT id, fecha_emision AS fecha, empresa_id, cajero_id, 'ELECTRONICA' AS tipo_factura FROM facturas_electronicas
+    ) f ON v.factura_id = f.id AND v.tipo_factura = f.tipo_factura
     WHERE ${whereSQL} AND p.categoria IS NOT NULL AND p.categoria != ''
     ORDER BY p.categoria ASC
   `;
@@ -212,8 +268,8 @@ router.get("/categorias-vendidas", (req: any, res: any) => {
 // --- NUEVO REPORTE DETALLADO DE PRODUCTOS VENDIDOS ---
 router.get("/productos-vendidos", (req: any, res: any) => {
   const empresa_id = req.user.empresa_id;
-  const { cajeroId, categoria, startDate, endDate, es_servicio, page = 1, limit = 10 } = req.query;
-  
+  const { cajeroId, categoria, startDate, endDate, es_servicio, tipo_factura, page = 1, limit = 10 } = req.query;
+
   const offset = (parseInt(page) - 1) * parseInt(limit);
 
   let whereClauses = ["f.empresa_id = ?"];
@@ -239,6 +295,11 @@ router.get("/productos-vendidos", (req: any, res: any) => {
     whereClauses.push("f.fecha <= ?");
     params.push(`${endDate} 23:59:59`);
   }
+  if (tipo_factura === "POS") {
+    whereClauses.push("f.tipo_factura = 'POS'");
+  } else if (tipo_factura === "ELECTRONICA") {
+    whereClauses.push("f.tipo_factura = 'ELECTRONICA'");
+  }
 
   const whereSQL = whereClauses.join(" AND ");
 
@@ -256,10 +317,21 @@ router.get("/productos-vendidos", (req: any, res: any) => {
       v.comision,
       cl.nombre as cliente,
       f.cliente_id,
+      f.tipo_factura,
+      f.prefijo,
+      f.consecutivo,
       (v.cantidad * v.precio_unitario) as subtotal,
       (v.cantidad * (v.precio_unitario - COALESCE(NULLIF(v.costo_unitario, 0), p.precio_compra, 0))) as utilidad
-    FROM ventas v
-    JOIN facturas_venta f ON v.factura_id = f.id
+    FROM (
+      SELECT id, factura_id, producto_id, cantidad, precio_unitario, costo_unitario, comision, 'POS' AS tipo_factura FROM ventas
+      UNION ALL
+      SELECT id, factura_electronica_id AS factura_id, producto_id, cantidad, precio_unitario, 0 AS costo_unitario, comision, 'ELECTRONICA' AS tipo_factura FROM ventas_electronicas
+    ) v
+    JOIN (
+      SELECT id, fecha, empresa_id, cajero_id, cliente_id, 'POS' AS tipo_factura, NULL AS prefijo, NULL AS consecutivo FROM facturas_venta
+      UNION ALL
+      SELECT id, fecha_emision AS fecha, empresa_id, cajero_id, cliente_id, 'ELECTRONICA' AS tipo_factura, prefijo, consecutivo FROM facturas_electronicas
+    ) f ON v.factura_id = f.id AND v.tipo_factura = f.tipo_factura
     JOIN productos p ON v.producto_id = p.id
     JOIN cajeros c ON f.cajero_id = c.id
     LEFT JOIN clientes cl ON f.cliente_id = cl.id
@@ -271,8 +343,16 @@ router.get("/productos-vendidos", (req: any, res: any) => {
   // Query for total count
   const queryCount = `
     SELECT COUNT(*) as total
-    FROM ventas v
-    JOIN facturas_venta f ON v.factura_id = f.id
+    FROM (
+      SELECT factura_id, producto_id, 'POS' AS tipo_factura FROM ventas
+      UNION ALL
+      SELECT factura_electronica_id AS factura_id, producto_id, 'ELECTRONICA' AS tipo_factura FROM ventas_electronicas
+    ) v
+    JOIN (
+      SELECT id, fecha, empresa_id, cajero_id, 'POS' AS tipo_factura FROM facturas_venta
+      UNION ALL
+      SELECT id, fecha_emision AS fecha, empresa_id, cajero_id, 'ELECTRONICA' AS tipo_factura FROM facturas_electronicas
+    ) f ON v.factura_id = f.id AND v.tipo_factura = f.tipo_factura
     JOIN productos p ON v.producto_id = p.id
     WHERE ${whereSQL}
   `;
@@ -290,24 +370,24 @@ router.get("/productos-vendidos", (req: any, res: any) => {
     runQuery(queryData, [...params, parseInt(limit), offset]),
     runQuery(queryCount, params)
   ])
-  .then(([data, count]: any) => {
-    res.json({
-      data,
-      total: count[0].total,
-      page: parseInt(page),
-      last_page: Math.ceil(count[0].total / parseInt(limit))
+    .then(([data, count]: any) => {
+      res.json({
+        data,
+        total: count[0].total,
+        page: parseInt(page),
+        last_page: Math.ceil(count[0].total / parseInt(limit))
+      });
+    })
+    .catch(err => {
+      console.error("Sold Products Report Error:", err);
+      res.status(500).json({ error: "Error al generar reporte de productos" });
     });
-  })
-  .catch(err => {
-    console.error("Sold Products Report Error:", err);
-    res.status(500).json({ error: "Error al generar reporte de productos" });
-  });
 });
 
 // --- REPORTE DE PRODUCTOS PRÓXIMOS A VENCER (IA PREDICTIVA) ---
 router.get("/proximos-vencer", (req: any, res: any) => {
   const empresa_id = req.user.empresa_id;
-  
+
   // Seleccionamos productos con fecha de vencimiento en los próximos 30 días
   const query = `
     SELECT id, nombre, referencia, categoria, cantidad, fecha_vencimiento,
@@ -334,7 +414,7 @@ import ExcelJS from "exceljs";
 // --- EXPORTAR REPORTE COMPLETO A EXCEL (.XLSX) ---
 router.get("/exportar-excel", (req: any, res: any) => {
   const empresa_id = req.user.empresa_id;
-  const { cajeroId, categoria, startDate, endDate } = req.query;
+  const { cajeroId, categoria, startDate, endDate, tipo_factura } = req.query;
 
   let whereClauses = ["f.empresa_id = ?"];
   let params: any[] = [empresa_id];
@@ -355,6 +435,11 @@ router.get("/exportar-excel", (req: any, res: any) => {
     whereClauses.push("f.fecha <= ?");
     params.push(`${endDate} 23:59:59`);
   }
+  if (tipo_factura === "POS") {
+    whereClauses.push("f.tipo_factura = 'POS'");
+  } else if (tipo_factura === "ELECTRONICA") {
+    whereClauses.push("f.tipo_factura = 'ELECTRONICA'");
+  }
 
   const whereSQL = whereClauses.join(" AND ");
 
@@ -370,9 +455,18 @@ router.get("/exportar-excel", (req: any, res: any) => {
       v.precio_unitario as PRECIO_U,
       v.comision as COMISION,
       (v.cantidad * v.precio_unitario) as TOTAL_RECAUDADO,
-      (v.cantidad * (v.precio_unitario - COALESCE(NULLIF(v.costo_unitario, 0), p.precio_compra, 0))) as UTILIDAD
-    FROM ventas v
-    JOIN facturas_venta f ON v.factura_id = f.id
+      (v.cantidad * (v.precio_unitario - COALESCE(NULLIF(v.costo_unitario, 0), p.precio_compra, 0))) as UTILIDAD,
+      f.tipo_factura as TIPO_FACTURA
+    FROM (
+      SELECT factura_id, producto_id, cantidad, precio_unitario, costo_unitario, comision, 'POS' AS tipo_factura FROM ventas
+      UNION ALL
+      SELECT factura_electronica_id AS factura_id, producto_id, cantidad, precio_unitario, 0 AS costo_unitario, comision, 'ELECTRONICA' AS tipo_factura FROM ventas_electronicas
+    ) v
+    JOIN (
+      SELECT id, fecha, empresa_id, cajero_id, cliente_id, 'POS' AS tipo_factura FROM facturas_venta
+      UNION ALL
+      SELECT id, fecha_emision AS fecha, empresa_id, cajero_id, cliente_id, 'ELECTRONICA' AS tipo_factura FROM facturas_electronicas
+    ) f ON v.factura_id = f.id AND v.tipo_factura = f.tipo_factura
     JOIN productos p ON v.producto_id = p.id
     JOIN cajeros c ON f.cajero_id = c.id
     LEFT JOIN clientes cl ON f.cliente_id = cl.id
@@ -400,6 +494,7 @@ router.get("/exportar-excel", (req: any, res: any) => {
       { header: "COMISIÓN ($)", key: "COMISION", width: 15 },
       { header: "TOTAL RECAUDADO", key: "TOTAL_RECAUDADO", width: 18 },
       { header: "UTILIDAD NETA", key: "UTILIDAD", width: 18 },
+      { header: "TIPO FACTURA", key: "TIPO_FACTURA", width: 15 },
     ];
 
     // Estilo para el encabezado
@@ -435,6 +530,188 @@ router.get("/exportar-excel", (req: any, res: any) => {
   });
 });
 
+// --- Panel financiero consolidado con POS y Facturas Electrónicas ---
+router.get("/financiero", async (req: any, res: any) => {
+  const empresa_id = req.user.empresa_id;
+  const { startDate, endDate } = req.query;
+
+  let dateFilterCompra = "";
+  let paramsCompra: any[] = [empresa_id];
+  let dateFilterPagos = "";
+  let paramsPagos: any[] = [empresa_id];
+
+  if (startDate) {
+    dateFilterCompra += " AND fecha >= ?";
+    paramsCompra.push(`${startDate} 00:00:00`);
+    dateFilterPagos += " AND fecha_pago >= ?";
+    paramsPagos.push(`${startDate} 00:00:00`);
+  }
+  if (endDate) {
+    dateFilterCompra += " AND fecha <= ?";
+    paramsCompra.push(`${endDate} 23:59:59`);
+    dateFilterPagos += " AND fecha_pago <= ?";
+    paramsPagos.push(`${endDate} 23:59:59`);
+  }
+
+  try {
+    const runQuery = (query: string, params: any[]) => {
+      return new Promise<any>((resolve, reject) => {
+        connection.query(query, params, (err, results) => {
+          if (err) reject(err);
+          else resolve(results);
+        });
+      });
+    };
+
+    const qIngresos = `
+      SELECT COALESCE(SUM(v.cantidad * v.precio_unitario), 0) as total
+      FROM (
+        SELECT id, empresa_id, 'POS' AS tipo_factura FROM facturas_venta
+        UNION ALL
+        SELECT id, empresa_id, 'ELECTRONICA' AS tipo_factura FROM facturas_electronicas
+      ) f
+      JOIN (
+        SELECT factura_id, cantidad, precio_unitario, 'POS' AS tipo_factura FROM ventas
+        UNION ALL
+        SELECT factura_electronica_id AS factura_id, cantidad, precio_unitario, 'ELECTRONICA' AS tipo_factura FROM ventas_electronicas
+      ) v ON f.id = v.factura_id AND f.tipo_factura = v.tipo_factura
+      WHERE f.empresa_id = ?
+    `;
+
+    const qVentasDia = `
+      SELECT COALESCE(SUM(v.cantidad * v.precio_unitario), 0) as total
+      FROM (
+        SELECT id, empresa_id, fecha, 'POS' AS tipo_factura FROM facturas_venta
+        UNION ALL
+        SELECT id, empresa_id, fecha_emision AS fecha, 'ELECTRONICA' AS tipo_factura FROM facturas_electronicas
+      ) f
+      JOIN (
+        SELECT factura_id, cantidad, precio_unitario, 'POS' AS tipo_factura FROM ventas
+        UNION ALL
+        SELECT factura_electronica_id AS factura_id, cantidad, precio_unitario, 'ELECTRONICA' AS tipo_factura FROM ventas_electronicas
+      ) v ON f.id = v.factura_id AND f.tipo_factura = v.tipo_factura
+      WHERE f.empresa_id = ? AND DATE(f.fecha) = CURDATE()
+    `;
+
+    const qBaseCaja = `SELECT COALESCE(SUM(base_caja), 0) as total FROM sesiones_caja WHERE empresa_id = ? AND estado = 'Abierta'`;
+    
+    const qMovimientos = `
+      SELECT 
+        COALESCE(SUM(CASE WHEN tipo = 'Ingreso' THEN monto ELSE 0 END), 0) as ingresos_manuales,
+        COALESCE(SUM(CASE WHEN tipo = 'Salida' THEN monto ELSE 0 END), 0) as salidas_manuales
+      FROM movimientos_caja
+      WHERE empresa_id = ? AND sesion_caja_id IN (SELECT id FROM sesiones_caja WHERE empresa_id = ? AND estado = 'Abierta')
+    `;
+    
+    const qVentasCajaAbierta = `
+      SELECT 
+        COALESCE(SUM(CASE WHEN f.metodo_pago = 'Efectivo' THEN (v.cantidad * v.precio_unitario) WHEN f.metodo_pago = 'Mixto' THEN (f.pago_efectivo * (v.cantidad * v.precio_unitario / NULLIF(f.total, 0))) ELSE 0 END), 0) as dinero_efectivo,
+        COALESCE(SUM(CASE WHEN f.metodo_pago IN ('Tarjeta', 'Transferencia') THEN (v.cantidad * v.precio_unitario) WHEN f.metodo_pago = 'Mixto' THEN (f.pago_transferencia * (v.cantidad * v.precio_unitario / NULLIF(f.total, 0))) ELSE 0 END), 0) as dinero_transferencia
+      FROM (
+        SELECT id, empresa_id, cajero_id, fecha, metodo_pago, pago_efectivo, pago_transferencia, total, 'POS' AS tipo_factura FROM facturas_venta
+        UNION ALL
+        SELECT id, empresa_id, cajero_id, fecha_emision AS fecha, metodo_pago, pago_efectivo, pago_transferencia, total, 'ELECTRONICA' AS tipo_factura FROM facturas_electronicas
+      ) f
+      JOIN (
+        SELECT factura_id, cantidad, precio_unitario, 'POS' AS tipo_factura FROM ventas
+        UNION ALL
+        SELECT factura_electronica_id AS factura_id, cantidad, precio_unitario, 'ELECTRONICA' AS tipo_factura FROM ventas_electronicas
+      ) v ON f.id = v.factura_id AND f.tipo_factura = v.tipo_factura
+      JOIN sesiones_caja s ON f.cajero_id = s.usuario_id AND s.estado = 'Abierta' AND f.fecha >= s.fecha_apertura
+      WHERE f.empresa_id = ?
+    `;
+
+    const qMovimientosGlobal = `
+      SELECT 
+        COALESCE(SUM(CASE WHEN tipo = 'Ingreso' THEN monto ELSE 0 END), 0) as entradas_historico,
+        COALESCE(SUM(CASE WHEN tipo = 'Salida' THEN monto ELSE 0 END), 0) as salidas_historico
+      FROM movimientos_caja
+      WHERE empresa_id = ?
+    `;
+
+    const qCxC = `
+      SELECT 
+        COALESCE(SUM(saldo_pendiente), 0) as total_cxc,
+        COALESCE(SUM(CASE WHEN fecha_vencimiento < CURDATE() THEN saldo_pendiente ELSE 0 END), 0) as vencidas_cxc
+      FROM cuentas_por_cobrar
+      WHERE empresa_id = ? AND estado = 'Pendiente'
+    `;
+
+    const qCxP = `
+      SELECT 
+        COALESCE(SUM(saldo_pendiente), 0) as total_cxp,
+        COALESCE(SUM(CASE WHEN fecha_vencimiento < CURDATE() THEN saldo_pendiente ELSE 0 END), 0) as vencidas_cxp
+      FROM cuentas_por_pagar
+      WHERE empresa_id = ? AND estado = 'Pendiente'
+    `;
+
+    const qCompras = `
+      SELECT COALESCE(SUM(total), 0) as total_compras
+      FROM facturas_compra
+      WHERE empresa_id = ? ${dateFilterCompra}
+    `;
+
+    const qPagos = `
+      SELECT COALESCE(SUM(total_pagado), 0) as total_pagos
+      FROM pagos_empleados
+      WHERE empresa_id = ? ${dateFilterPagos}
+    `;
+
+    const [
+      ingresosData,
+      ventasDiaData,
+      baseCajaData,
+      movimientosCajaAbiertaData,
+      ventasCajaAbiertaData,
+      movimientosGlobalData,
+      cxcData,
+      cxpData,
+      comprasData,
+      pagosData
+    ] = await Promise.all([
+      runQuery(qIngresos, [empresa_id]),
+      runQuery(qVentasDia, [empresa_id]),
+      runQuery(qBaseCaja, [empresa_id]),
+      runQuery(qMovimientos, [empresa_id, empresa_id]),
+      runQuery(qVentasCajaAbierta, [empresa_id]),
+      runQuery(qMovimientosGlobal, [empresa_id]),
+      runQuery(qCxC, [empresa_id]),
+      runQuery(qCxP, [empresa_id]),
+      runQuery(qCompras, paramsCompra),
+      runQuery(qPagos, paramsPagos)
+    ]);
+
+    const cajaActual = 
+      Number(baseCajaData[0].total) + 
+      Number(movimientosCajaAbiertaData[0].ingresos_manuales) - 
+      Number(movimientosCajaAbiertaData[0].salidas_manuales) +
+      Number(ventasCajaAbiertaData[0].dinero_efectivo) + 
+      Number(ventasCajaAbiertaData[0].dinero_transferencia);
+
+    res.json({
+      ingresosHistorico: ingresosData[0].total,
+      ventasDia: ventasDiaData[0].total,
+      cajaActual: cajaActual,
+      entradasManuales: movimientosGlobalData[0].entradas_historico,
+      salidasManuales: movimientosGlobalData[0].salidas_historico,
+      cxc: {
+        total: cxcData[0].total_cxc,
+        vencidas: cxcData[0].vencidas_cxc
+      },
+      cxp: {
+        total: cxpData[0].total_cxp,
+        vencidas: cxpData[0].vencidas_cxp
+      },
+      comprasRango: comprasData[0].total_compras,
+      pagosEmpleadosRango: pagosData[0].total_pagos
+    });
+
+  } catch (error) {
+    console.error("Error Financial Dashboard:", error);
+    res.status(500).json({ error: "Error obteniendo datos financieros" });
+  }
+});
+
 export default router;
-export {};
+export { };
 

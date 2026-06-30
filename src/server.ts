@@ -23,6 +23,8 @@ import whatsapp from "./routes/whatsapp";
 import dian from "./routes/dian";
 import facturacionElectronica from "./routes/facturacionElectronica";
 import caja from "./routes/caja";
+import cartera from "./routes/cartera";
+import documentosSoporte from "./routes/documentosSoporte";
 
 
 import { createServer } from "http";
@@ -84,6 +86,8 @@ app.use("/whatsapp", whatsapp);
 app.use("/dian", dian);
 app.use("/facturacion-electronica", facturacionElectronica);
 app.use("/caja", caja);
+app.use("/cartera", cartera);
+app.use("/documentos-soporte", documentosSoporte);
 
 
 const PORT = process.env.PORT || 4000;
