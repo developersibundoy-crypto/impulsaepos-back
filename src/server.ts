@@ -25,7 +25,8 @@ import facturacionElectronica from "./routes/facturacionElectronica";
 import caja from "./routes/caja";
 import cartera from "./routes/cartera";
 import documentosSoporte from "./routes/documentosSoporte";
-
+import puntos from "./routes/puntos";
+import sorteo from "./routes/sorteo";
 
 import { createServer } from "http";
 import { Server } from "socket.io";
@@ -53,7 +54,7 @@ app.use((req: any, _res, next) => {
 
 io.on("connection", (socket) => {
   console.log(`[SOCKET]: Nuevo cliente conectado - ID: ${socket.id}`);
-  
+
   // Unirse a una sala por empresa para no mezclar datos si hubiera múltiples empresas
   socket.on("join_empresa", (empresaId) => {
     socket.join(`empresa_${empresaId}`);
@@ -88,7 +89,8 @@ app.use("/facturacion-electronica", facturacionElectronica);
 app.use("/caja", caja);
 app.use("/cartera", cartera);
 app.use("/documentos-soporte", documentosSoporte);
-
+app.use("/puntos", puntos);
+app.use("/sorteo", sorteo);
 
 const PORT = process.env.PORT || 4000;
 httpServer.listen(PORT, () => {

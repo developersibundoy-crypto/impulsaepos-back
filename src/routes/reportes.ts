@@ -539,18 +539,24 @@ router.get("/financiero", async (req: any, res: any) => {
   let paramsCompra: any[] = [empresa_id];
   let dateFilterPagos = "";
   let paramsPagos: any[] = [empresa_id];
+  let dateFilterMov = "";
+  let paramsMov: any[] = [empresa_id];
 
   if (startDate) {
     dateFilterCompra += " AND fecha >= ?";
     paramsCompra.push(`${startDate} 00:00:00`);
     dateFilterPagos += " AND fecha_pago >= ?";
     paramsPagos.push(`${startDate} 00:00:00`);
+    dateFilterMov += " AND m.fecha >= ?";
+    paramsMov.push(`${startDate} 00:00:00`);
   }
   if (endDate) {
     dateFilterCompra += " AND fecha <= ?";
     paramsCompra.push(`${endDate} 23:59:59`);
     dateFilterPagos += " AND fecha_pago <= ?";
     paramsPagos.push(`${endDate} 23:59:59`);
+    dateFilterMov += " AND m.fecha <= ?";
+    paramsMov.push(`${endDate} 23:59:59`);
   }
 
   try {
@@ -625,8 +631,8 @@ router.get("/financiero", async (req: any, res: any) => {
       SELECT 
         COALESCE(SUM(CASE WHEN tipo = 'Ingreso' THEN monto ELSE 0 END), 0) as entradas_historico,
         COALESCE(SUM(CASE WHEN tipo = 'Salida' THEN monto ELSE 0 END), 0) as salidas_historico
-      FROM movimientos_caja
-      WHERE empresa_id = ?
+      FROM movimientos_caja m
+      WHERE m.empresa_id = ? ${dateFilterMov}
     `;
 
     const qCxC = `
@@ -674,7 +680,7 @@ router.get("/financiero", async (req: any, res: any) => {
       runQuery(qBaseCaja, [empresa_id]),
       runQuery(qMovimientos, [empresa_id, empresa_id]),
       runQuery(qVentasCajaAbierta, [empresa_id]),
-      runQuery(qMovimientosGlobal, [empresa_id]),
+      runQuery(qMovimientosGlobal, paramsMov),
       runQuery(qCxC, [empresa_id]),
       runQuery(qCxP, [empresa_id]),
       runQuery(qCompras, paramsCompra),

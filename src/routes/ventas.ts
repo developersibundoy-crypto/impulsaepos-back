@@ -1,6 +1,7 @@
 import express from "express";
 import pool from "../conection";
 import { verifyTokenAndTenant, verifyPermission } from "../middlewares/authMiddleware";
+import puntosService from "../services/puntosService";
 
 const router = express.Router();
 
@@ -136,7 +137,41 @@ router.post("/", verifyPermission("venta"), async (req: any, res: any) => {
     }
 
     await conn.commit();
-    res.status(201).json({ success: true, factura_id: facturaId });
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // SISTEMA DE PUNTOS: Acumular puntos usando el service financiero
+    // ─────────────────────────────────────────────────────────────────────────
+    let puntos_info = null;
+    if (clId && clId !== 1) {
+      try {
+        const result = await puntosService.acumular(
+          empresa_id,
+          clId,
+          totalVal,
+          items,
+          facturaId,
+          "POS",
+          req.io
+        );
+
+        if (result) {
+          puntos_info = {
+            puntosAntes: result.puntos_totales - result.puntos_ganados,
+            puntosGanados: result.puntos_ganados,
+            puntosDespues: result.puntos_totales,
+            meta: result.puntos_totales,
+            premio: "",
+            gano_premio: false,
+            descuento_puntos: result.descuento_puntos,
+            puntos_redimidos: result.puntos_redimidos,
+          };
+        }
+      } catch (puntosError: any) {
+        console.error("[PUNTOS] Error acumulando puntos (no crítico):", puntosError.message);
+      }
+    }
+
+    res.status(201).json({ success: true, factura_id: facturaId, puntos_info });
 
   } catch (error: any) {
     if (conn) await conn.rollback();
@@ -146,6 +181,7 @@ router.post("/", verifyPermission("venta"), async (req: any, res: any) => {
     if (conn) conn.release();
   }
 });
+
 
 // Listar facturas de venta - Requiere permiso de facturas_venta
 router.get("/", verifyPermission("facturas_venta"), (req: any, res: any) => {

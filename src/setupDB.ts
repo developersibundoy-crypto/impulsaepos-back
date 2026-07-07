@@ -20,6 +20,9 @@ connection.connect((err: any) => {
       
       const setupQueries = [
         "SET FOREIGN_KEY_CHECKS = 0",
+        "DROP TABLE IF EXISTS historial_premios",
+        "DROP TABLE IF EXISTS historial_puntos",
+        "DROP TABLE IF EXISTS config_fidelizacion",
         "DROP TABLE IF EXISTS kardex",
         "DROP TABLE IF EXISTS empresa_config",
         "DROP TABLE IF EXISTS pagos_suscripcion",
@@ -133,7 +136,45 @@ connection.connect((err: any) => {
           telefono VARCHAR(50),
           correo VARCHAR(100),
           direccion VARCHAR(255),
+          puntos_acumulados INT DEFAULT 0,
           FOREIGN KEY (empresa_id) REFERENCES empresas_suscritas(id) ON DELETE CASCADE
+        )`,
+        `CREATE TABLE config_fidelizacion (
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          empresa_id INT NOT NULL UNIQUE,
+          puntos_por_compra INT DEFAULT 1,
+          puntos_por_compra_mayor INT DEFAULT 50,
+          monto_umbral DECIMAL(15,2) DEFAULT 50000,
+          meta_puntos INT DEFAULT 10,
+          descripcion_premio VARCHAR(255) DEFAULT 'Premio de fidelización',
+          activo BOOLEAN DEFAULT 0,
+          FOREIGN KEY (empresa_id) REFERENCES empresas_suscritas(id) ON DELETE CASCADE
+        )`,
+        `CREATE TABLE historial_puntos (
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          empresa_id INT NOT NULL,
+          cliente_id INT NOT NULL,
+          factura_id INT NULL,
+          factura_tipo VARCHAR(20) DEFAULT 'POS',
+          puntos_ganados INT NOT NULL DEFAULT 0,
+          puntos_antes INT NOT NULL DEFAULT 0,
+          puntos_despues INT NOT NULL DEFAULT 0,
+          total_venta DECIMAL(15,2) DEFAULT 0,
+          fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          FOREIGN KEY (empresa_id) REFERENCES empresas_suscritas(id) ON DELETE CASCADE,
+          FOREIGN KEY (cliente_id) REFERENCES clientes(id) ON DELETE CASCADE
+        )`,
+        `CREATE TABLE historial_premios (
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          empresa_id INT NOT NULL,
+          cliente_id INT NOT NULL,
+          puntos_canjeados INT NOT NULL DEFAULT 0,
+          descripcion_premio VARCHAR(255),
+          cajero_id INT NULL,
+          fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          FOREIGN KEY (empresa_id) REFERENCES empresas_suscritas(id) ON DELETE CASCADE,
+          FOREIGN KEY (cliente_id) REFERENCES clientes(id) ON DELETE CASCADE,
+          FOREIGN KEY (cajero_id) REFERENCES cajeros(id) ON DELETE SET NULL
         )`,
         `CREATE TABLE facturas_venta (
           id INT AUTO_INCREMENT PRIMARY KEY,
@@ -157,6 +198,7 @@ connection.connect((err: any) => {
           cantidad INT NOT NULL,
           precio_unitario DECIMAL(15,2) NOT NULL,
           costo_unitario DECIMAL(15,2) DEFAULT 0,
+          comision DECIMAL(15,2) DEFAULT 0,
           FOREIGN KEY (empresa_id) REFERENCES empresas_suscritas(id) ON DELETE CASCADE,
           FOREIGN KEY (factura_id) REFERENCES facturas_venta(id) ON DELETE CASCADE,
           FOREIGN KEY (producto_id) REFERENCES productos(id) ON DELETE SET NULL
