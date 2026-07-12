@@ -6,7 +6,7 @@ dotenv.config();
 
 async function testApi() {
   const secret = process.env.JWT_SECRET || 'your_jwt_secret_key';
-  
+
   // Create a token for a cajero (e.g., company 1, cajero 1)
   const token = jwt.sign(
     {
@@ -43,7 +43,7 @@ async function testApi() {
   };
 
   try {
-    const res = await axios.post('http://localhost:4000/ventas', payload, {
+    const res = await axios.post(`${API_BASE_URL}/ventas`, payload, {
       headers: {
         Authorization: `Bearer ${token}`
       }

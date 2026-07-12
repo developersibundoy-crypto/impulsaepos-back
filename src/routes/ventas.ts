@@ -142,6 +142,7 @@ router.post("/", verifyPermission("venta"), async (req: any, res: any) => {
     // SISTEMA DE PUNTOS: Acumular puntos usando el service financiero
     // ─────────────────────────────────────────────────────────────────────────
     let puntos_info = null;
+    let puntos_error: string | null = null;
     if (clId && clId !== 1) {
       try {
         const result = await puntosService.acumular(
@@ -167,11 +168,12 @@ router.post("/", verifyPermission("venta"), async (req: any, res: any) => {
           };
         }
       } catch (puntosError: any) {
-        console.error("[PUNTOS] Error acumulando puntos (no crítico):", puntosError.message);
+        puntos_error = puntosError?.message || "Error desconocido acumulando puntos.";
+        console.error("[PUNTOS] Error acumulando puntos (no crítico):", puntos_error);
       }
     }
 
-    res.status(201).json({ success: true, factura_id: facturaId, puntos_info });
+    res.status(201).json({ success: true, factura_id: facturaId, puntos_info, puntos_error });
 
   } catch (error: any) {
     if (conn) await conn.rollback();

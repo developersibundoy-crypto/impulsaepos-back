@@ -1,4 +1,4 @@
-import dotenv from "dotenv";
+import "./config/loadEnv";
 process.env.TZ = "America/Bogota";
 import express from "express";
 import cors from "cors";
@@ -30,8 +30,6 @@ import sorteo from "./routes/sorteo";
 
 import { createServer } from "http";
 import { Server } from "socket.io";
-
-dotenv.config();
 
 const app = express();
 const httpServer = createServer(app);
