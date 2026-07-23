@@ -1,4 +1,4 @@
-import './config/loadEnv';
+import 'dotenv/config';
 import mysql from "mysql2";
 
 const pool = mysql.createPool({

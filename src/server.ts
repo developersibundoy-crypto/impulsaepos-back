@@ -1,4 +1,4 @@
-import "./config/loadEnv";
+import "dotenv/config";
 process.env.TZ = "America/Bogota";
 import express from "express";
 import cors from "cors";

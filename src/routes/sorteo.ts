@@ -2,6 +2,17 @@ import express from "express";
 import connection from "../conection";
 import { verifyTokenAndTenant } from "../middlewares/authMiddleware";
 
+const formatToDateString = (d: any) => {
+  if (!d) return null;
+  if (d instanceof Date) {
+    const year = d.getFullYear();
+    const month = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+  }
+  return String(d).slice(0, 10);
+};
+
 const router = express.Router();
 
 router.use(verifyTokenAndTenant);
@@ -80,39 +91,43 @@ router.get("/clientes", (req: any, res: any) => {
 
   // Check if config has purchase filters
   connection.query(
-    "SELECT filtro_monto_min, filtro_compras_min, filtro_fecha_inicio, filtro_fecha_fin FROM sorteo_config WHERE empresa_id = ?",
+    "SELECT filtro_monto_min, filtro_compras_min, filtro_fecha_inicio, filtro_fecha_fin, numero_sorteo FROM sorteo_config WHERE empresa_id = ?",
     [empresa_id],
     (errCfg: any, configRows: any) => {
       if (errCfg) return res.status(500).json({ error: errCfg.message });
 
       const cfg = configRows[0] || {};
       const hasPurchaseFilter = cfg.filtro_monto_min && cfg.filtro_fecha_inicio && cfg.filtro_fecha_fin;
+      const numero_sorteo = cfg.numero_sorteo || 1;
 
       let purchaseJoin = "";
-      let purchaseWhere = "";
-      let params: any[] = [empresa_id];
+      let purchaseParams: any[] = [];
 
       if (hasPurchaseFilter) {
         const minAmount = parseFloat(cfg.filtro_monto_min);
         const minPurchases = parseInt(cfg.filtro_compras_min) || 1;
+        const startDate = formatToDateString(cfg.filtro_fecha_inicio);
+        const endDate = formatToDateString(cfg.filtro_fecha_fin);
 
         purchaseJoin = `
           INNER JOIN (
             SELECT cliente_id, COUNT(*) as total_compras
             FROM (
               SELECT fv.cliente_id, fv.total, fv.fecha FROM facturas_venta fv
-              WHERE fv.empresa_id = ? AND fv.total >= ? AND fv.fecha >= ? AND fv.fecha <= ?
+              WHERE fv.empresa_id = ? AND fv.total >= ? AND DATE(fv.fecha) >= ? AND DATE(fv.fecha) <= ?
               UNION ALL
               SELECT fe.cliente_id, fe.total, fe.fecha_emision as fecha FROM facturas_electronicas fe
-              WHERE fe.empresa_id = ? AND fe.total >= ? AND fe.fecha_emision >= ? AND fe.fecha_emision <= ?
+              WHERE fe.empresa_id = ? AND fe.total >= ? AND DATE(fe.fecha_emision) >= ? AND DATE(fe.fecha_emision) <= ?
             ) compras
             GROUP BY cliente_id
             HAVING COUNT(*) >= ?
           ) pc ON c.id = pc.cliente_id
         `;
-        params.push(empresa_id, minAmount, cfg.filtro_fecha_inicio, cfg.filtro_fecha_fin);
-        params.push(empresa_id, minAmount, cfg.filtro_fecha_inicio, cfg.filtro_fecha_fin);
-        params.push(minPurchases);
+        purchaseParams = [
+          empresa_id, minAmount, startDate, endDate,
+          empresa_id, minAmount, startDate, endDate,
+          minPurchases
+        ];
       }
 
       connection.query(
@@ -126,14 +141,12 @@ router.get("/clientes", (req: any, res: any) => {
          LEFT JOIN (
            SELECT cliente_id, 1 as gano, premio_nombre, fecha, estado_entrega
            FROM sorteo_historial
-           WHERE empresa_id = ?
+           WHERE empresa_id = ? AND numero_sorteo = ?
            GROUP BY cliente_id
          ) h ON c.id = h.cliente_id
          WHERE c.empresa_id = ? AND c.estado = 'Activo'
          ORDER BY c.nombre ASC`,
-        hasPurchaseFilter
-          ? [...params, empresa_id, empresa_id]
-          : [empresa_id, empresa_id, empresa_id],
+        [...purchaseParams, empresa_id, numero_sorteo, empresa_id],
         (err: any, results: any) => {
           if (err) return res.status(500).json({ error: err.message });
           res.json(results);
@@ -157,32 +170,35 @@ router.get("/estado", (req: any, res: any) => {
 
     const cfg = configRows[0] || {};
     const hasPurchaseFilter = cfg.filtro_monto_min && cfg.filtro_fecha_inicio && cfg.filtro_fecha_fin;
+    const numero_sorteo = cfg.numero_sorteo || 1;
 
     let purchaseSubquery = "";
     let purchaseParams: any[] = [];
     if (hasPurchaseFilter) {
       const minAmount = parseFloat(cfg.filtro_monto_min);
       const minPurchases = parseInt(cfg.filtro_compras_min) || 1;
+      const startDate = formatToDateString(cfg.filtro_fecha_inicio);
+      const endDate = formatToDateString(cfg.filtro_fecha_fin);
       purchaseSubquery = `
         AND c.id IN (
           SELECT cliente_id FROM (
             SELECT fv.cliente_id FROM facturas_venta fv
-            WHERE fv.empresa_id = ? AND fv.total >= ? AND fv.fecha >= ? AND fv.fecha <= ?
+            WHERE fv.empresa_id = ? AND fv.total >= ? AND DATE(fv.fecha) >= ? AND DATE(fv.fecha) <= ?
             UNION ALL
             SELECT fe.cliente_id FROM facturas_electronicas fe
-            WHERE fe.empresa_id = ? AND fe.total >= ? AND fe.fecha_emision >= ? AND fe.fecha_emision <= ?
+            WHERE fe.empresa_id = ? AND fe.total >= ? AND DATE(fe.fecha_emision) >= ? AND DATE(fe.fecha_emision) <= ?
           ) compras GROUP BY cliente_id HAVING COUNT(*) >= ?
         )
       `;
-      purchaseParams = [empresa_id, minAmount, cfg.filtro_fecha_inicio, cfg.filtro_fecha_fin,
-                        empresa_id, minAmount, cfg.filtro_fecha_inicio, cfg.filtro_fecha_fin,
+      purchaseParams = [empresa_id, minAmount, startDate, endDate,
+                        empresa_id, minAmount, startDate, endDate,
                         minPurchases];
     }
 
     const qClientesDisponibles = `
       SELECT COUNT(*) as total FROM clientes c
       WHERE c.empresa_id = ? AND c.estado = 'Activo'
-      AND c.id NOT IN (SELECT cliente_id FROM sorteo_historial WHERE empresa_id = ?)
+      AND c.id NOT IN (SELECT cliente_id FROM sorteo_historial WHERE empresa_id = ? AND numero_sorteo = ?)
       ${purchaseSubquery}
     `;
 
@@ -195,7 +211,7 @@ router.get("/estado", (req: any, res: any) => {
         connection.query(qGanadores, [empresa_id], (err4: any, ganadoresRows: any) => {
           if (err4) return res.status(500).json({ error: err4.message });
 
-          connection.query(qClientesDisponibles, [empresa_id, empresa_id, ...purchaseParams], (err5: any, clientesRows: any) => {
+          connection.query(qClientesDisponibles, [empresa_id, empresa_id, numero_sorteo, ...purchaseParams], (err5: any, clientesRows: any) => {
             if (err5) return res.status(500).json({ error: err5.message });
 
             res.json({
@@ -239,43 +255,43 @@ router.post("/girar", (req: any, res: any) => {
 
       const cliente = clientes[0];
 
-      // Check if already won
+      // Get or create sorteo_config
       connection.query(
-        "SELECT id FROM sorteo_historial WHERE empresa_id = ? AND cliente_id = ?",
-        [empresa_id, cliente_id],
-        (err2: any, historial: any) => {
-          if (err2) return res.status(500).json({ error: err2.message });
-          if (historial.length > 0) return res.status(400).json({ error: "Este cliente ya ha ganado un premio" });
+        "SELECT id, numero_sorteo FROM sorteo_config WHERE empresa_id = ?",
+        [empresa_id],
+        (errCfg: any, configRows: any) => {
+          if (errCfg) return res.status(500).json({ error: errCfg.message });
 
-          // Get next available prize (FIFO by orden_entrega)
+          let numero_sorteo = 1;
+          let configId = null;
+          if (configRows.length > 0) {
+            numero_sorteo = configRows[0].numero_sorteo;
+            configId = configRows[0].id;
+          }
+
+          // Check if already won in this event
           connection.query(
-            `SELECT id, nombre, cantidad_disponible FROM premios_sorteo
-             WHERE empresa_id = ? AND estado = 'Activo' AND cantidad_disponible > 0
-             ORDER BY orden_entrega ASC, id ASC LIMIT 1`,
-            [empresa_id],
-            (err3: any, premios: any) => {
-              if (err3) return res.status(500).json({ error: err3.message });
-              if (premios.length === 0) return res.status(400).json({ error: "No hay premios disponibles" });
+            "SELECT id FROM sorteo_historial WHERE empresa_id = ? AND cliente_id = ? AND numero_sorteo = ?",
+            [empresa_id, cliente_id, numero_sorteo],
+            (err2: any, historial: any) => {
+              if (err2) return res.status(500).json({ error: err2.message });
+              if (historial.length > 0) return res.status(400).json({ error: "Este cliente ya ha ganado un premio en este evento" });
 
-              const premio = premios[0];
-
-              // Get or create sorteo_config
+              // Get next available prize (FIFO by orden_entrega)
               connection.query(
-                "SELECT id, numero_sorteo FROM sorteo_config WHERE empresa_id = ?",
+                `SELECT id, nombre, cantidad_disponible FROM premios_sorteo
+                 WHERE empresa_id = ? AND estado = 'Activo' AND cantidad_disponible > 0
+                 ORDER BY orden_entrega ASC, id ASC LIMIT 1`,
                 [empresa_id],
-                (err4: any, configRows: any) => {
-                  if (err4) return res.status(500).json({ error: err4.message });
+                (err3: any, premios: any) => {
+                  if (err3) return res.status(500).json({ error: err3.message });
+                  if (premios.length === 0) return res.status(400).json({ error: "No hay premios disponibles" });
+
+                  const premio = premios[0];
 
                   const now = new Date();
                   const fecha = now.toISOString().slice(0, 10);
                   const hora = now.toTimeString().slice(0, 8);
-                  let numero_sorteo = 1;
-                  let configId = null;
-
-                  if (configRows.length > 0) {
-                    numero_sorteo = configRows[0].numero_sorteo;
-                    configId = configRows[0].id;
-                  }
 
                   // Insert history
                   connection.query(
@@ -431,16 +447,41 @@ router.post("/config", (req: any, res: any) => {
   const empresa_id = req.user.empresa_id;
   const { filtro_monto_min, filtro_compras_min, filtro_fecha_inicio, filtro_fecha_fin } = req.body;
 
-  connection.query(
-    `INSERT INTO sorteo_config (empresa_id, estado, numero_sorteo, fecha_inicio, filtro_monto_min, filtro_compras_min, filtro_fecha_inicio, filtro_fecha_fin)
-     VALUES (?, 'Activo', 1, CURDATE(), ?, ?, ?, ?)
-     ON DUPLICATE KEY UPDATE filtro_monto_min = VALUES(filtro_monto_min), filtro_compras_min = VALUES(filtro_compras_min), filtro_fecha_inicio = VALUES(filtro_fecha_inicio), filtro_fecha_fin = VALUES(filtro_fecha_fin)`,
-    [empresa_id, filtro_monto_min || null, filtro_compras_min || null, filtro_fecha_inicio || null, filtro_fecha_fin || null],
-    (err: any, results: any) => {
-      if (err) return res.status(500).json({ error: err.message });
-      res.json({ message: "Configuración guardada" });
+  connection.query("SELECT filtro_fecha_inicio, filtro_fecha_fin, numero_sorteo FROM sorteo_config WHERE empresa_id = ?", [empresa_id], (err: any, rows: any) => {
+    if (err) return res.status(500).json({ error: err.message });
+    
+    let nextSorteo = 1;
+
+    if (rows.length > 0) {
+      const current = rows[0];
+      nextSorteo = current.numero_sorteo || 1;
+      
+      const currInicio = formatToDateString(current.filtro_fecha_inicio);
+      const currFin = formatToDateString(current.filtro_fecha_fin);
+      const newInicio = filtro_fecha_inicio || null;
+      const newFin = filtro_fecha_fin || null;
+      
+      if (currInicio !== newInicio || currFin !== newFin) {
+        nextSorteo += 1;
+      }
     }
-  );
+
+    connection.query(
+      `INSERT INTO sorteo_config (empresa_id, estado, numero_sorteo, fecha_inicio, filtro_monto_min, filtro_compras_min, filtro_fecha_inicio, filtro_fecha_fin)
+       VALUES (?, 'Activo', ?, CURDATE(), ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE 
+         numero_sorteo = VALUES(numero_sorteo),
+         filtro_monto_min = VALUES(filtro_monto_min), 
+         filtro_compras_min = VALUES(filtro_compras_min), 
+         filtro_fecha_inicio = VALUES(filtro_fecha_inicio), 
+         filtro_fecha_fin = VALUES(filtro_fecha_fin)`,
+      [empresa_id, nextSorteo, filtro_monto_min || null, filtro_compras_min || null, filtro_fecha_inicio || null, filtro_fecha_fin || null],
+      (err2: any, results: any) => {
+        if (err2) return res.status(500).json({ error: err2.message });
+        res.json({ message: "Configuración guardada", numero_sorteo: nextSorteo });
+      }
+    );
+  });
 });
 
 export default router;
