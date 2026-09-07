@@ -36,9 +36,32 @@ router.post("/", verifyPermission("venta"), async (req: any, res: any) => {
     // --- NUEVO: Obtener porcentaje de comisión del cajero para desglose itemizado ---
     let percComision = 0;
     if (cId) {
-      const [cData]: any = await conn.query("SELECT paga_comisiones, porcentaje_comision FROM cajeros WHERE id = ?", [cId]);
+      const [cData]: any = await conn.query("SELECT paga_comisiones, porcentaje_comision_base, meta_comision, porcentaje_comision_meta FROM cajeros WHERE id = ?", [cId]);
       if (cData.length > 0 && cData[0].paga_comisiones) {
-        percComision = parseFloat(cData[0].porcentaje_comision) || 0;
+        const cashier = cData[0];
+        const meta = parseFloat(cashier.meta_comision) || 0;
+        
+        if (meta > 0) {
+          const [ventasMes]: any = await conn.query(`
+            SELECT COALESCE(SUM(total), 0) as total_mes FROM facturas_venta 
+            WHERE cajero_id = ? AND empresa_id = ? AND MONTH(fecha) = MONTH(CURRENT_DATE()) AND YEAR(fecha) = YEAR(CURRENT_DATE())
+          `, [cId, empresa_id]);
+          const [ventasElec]: any = await conn.query(`
+            SELECT COALESCE(SUM(total), 0) as total_mes FROM facturas_electronicas 
+            WHERE cajero_id = ? AND empresa_id = ? AND MONTH(fecha_emision) = MONTH(CURRENT_DATE()) AND YEAR(fecha_emision) = YEAR(CURRENT_DATE())
+          `, [cId, empresa_id]);
+          
+          const acumulado = parseFloat(ventasMes[0].total_mes) + parseFloat(ventasElec[0].total_mes);
+          const totalVentaActual = parseFloat(total) || 0;
+          
+          if (acumulado + totalVentaActual > meta) {
+             percComision = parseFloat(cashier.porcentaje_comision_meta) || 0;
+          } else {
+             percComision = parseFloat(cashier.porcentaje_comision_base) || 0;
+          }
+        } else {
+          percComision = parseFloat(cashier.porcentaje_comision_base) || 0;
+        }
       }
     }
     
@@ -351,7 +374,7 @@ router.get("/:id", (req: any, res: any) => {
 
   if (tipo === "ELECTRONICA") {
     const query = `
-      SELECT v.cantidad, v.precio_unitario, p.nombre, p.referencia 
+      SELECT v.producto_id, v.cantidad, v.precio_unitario, p.nombre, p.referencia 
       FROM ventas_electronicas v
       JOIN facturas_electronicas fe ON v.factura_electronica_id = fe.id
       JOIN productos p ON v.producto_id = p.id
@@ -363,7 +386,7 @@ router.get("/:id", (req: any, res: any) => {
     });
   } else {
     const query = `
-      SELECT v.cantidad, v.precio_unitario, p.nombre, p.referencia 
+      SELECT v.producto_id, v.cantidad, v.precio_unitario, p.nombre, p.referencia 
       FROM ventas v
       JOIN productos p ON v.producto_id = p.id
       WHERE v.factura_id = ? AND v.empresa_id = ?
@@ -469,6 +492,138 @@ router.delete("/:id", verifyPermission("facturas_venta"), async (req: any, res: 
     if (conn) await conn.rollback();
     console.error("Error al anular factura:", error);
     res.status(500).json({ error: "No se pudo anular la factura: " + error.message });
+  } finally {
+    if (conn) conn.release();
+  }
+});
+
+// Registrar un cambio de producto en factura POS
+router.post("/cambio-producto", verifyPermission("venta"), async (req: any, res: any) => {
+  const empresa_id = req.user.empresa_id;
+  const { 
+    factura_id, 
+    producto_devuelto_id, 
+    producto_nuevo_id, 
+    cantidad_devuelta, 
+    cantidad_nueva,
+    valor_original, 
+    valor_nuevo, 
+    saldo_adicional, 
+    metodo_pago 
+  } = req.body;
+  
+  const cId = req.user.cajero_id || null;
+  const usuario_nombre = req.user.username || 'Sistema';
+
+  if (!factura_id || !producto_devuelto_id || !producto_nuevo_id || !cantidad_devuelta || !cantidad_nueva) {
+    return res.status(400).json({ error: "Datos incompletos para procesar el cambio." });
+  }
+
+  const promisePool = pool.promise();
+  let conn;
+
+  try {
+    conn = await promisePool.getConnection();
+    await conn.beginTransaction();
+
+    // 1. Validar que la factura es POS y pertenece a la empresa
+    const [factura]: any = await conn.query(
+      "SELECT id FROM facturas_venta WHERE id = ? AND empresa_id = ?",
+      [factura_id, empresa_id]
+    );
+
+    if (factura.length === 0) {
+      throw new Error("La factura original no existe o no es de tipo POS.");
+    }
+
+    // 2. Validar que el producto devuelto está en la factura
+    const [ventaDetalle]: any = await conn.query(
+      "SELECT id, cantidad, precio_unitario FROM ventas WHERE factura_id = ? AND producto_id = ? AND empresa_id = ?",
+      [factura_id, producto_devuelto_id, empresa_id]
+    );
+
+    if (ventaDetalle.length === 0) {
+      throw new Error("El producto devuelto no pertenece a esta factura.");
+    }
+
+    // 3. Reemplazar el producto en la factura: actualizar la fila en `ventas`
+    await conn.query(
+      "UPDATE ventas SET producto_id = ?, precio_unitario = ?, costo_unitario = (SELECT COALESCE(precio_compra, 0) FROM productos WHERE id = ?) WHERE id = ? AND empresa_id = ?",
+      [producto_nuevo_id, valor_nuevo, producto_nuevo_id, ventaDetalle[0].id, empresa_id]
+    );
+
+    // 4. Actualizar el total de la factura
+    const diferenciaPrecio = valor_nuevo - ventaDetalle[0].precio_unitario;
+    if (diferenciaPrecio !== 0) {
+      await conn.query(
+        "UPDATE facturas_venta SET total = total + ? WHERE id = ? AND empresa_id = ?",
+        [diferenciaPrecio * cantidad_devuelta, factura_id, empresa_id]
+      );
+    }
+
+    // 5. Consultar y aumentar stock del producto devuelto
+    const [pDevueltoData]: any = await conn.query(
+      "SELECT cantidad, es_servicio FROM productos WHERE id = ? AND empresa_id = ? FOR UPDATE", 
+      [producto_devuelto_id, empresa_id]
+    );
+    
+    if (pDevueltoData.length > 0 && !pDevueltoData[0].es_servicio) {
+      const stockAntesD = pDevueltoData[0].cantidad;
+      await conn.query("UPDATE productos SET cantidad = cantidad + ? WHERE id = ? AND empresa_id = ?", [cantidad_devuelta, producto_devuelto_id, empresa_id]);
+      
+      await conn.query(
+        "INSERT INTO kardex (producto_id, empresa_id, tipo_movimiento, cantidad_antes, cantidad_modificada, cantidad_despues, motivo, usuario_nombre, referencia) VALUES (?, ?, 'ENTRADA_CAMBIO', ?, ?, ?, ?, ?, ?)",
+        [producto_devuelto_id, empresa_id, stockAntesD, cantidad_devuelta, stockAntesD + cantidad_devuelta, `Devolución por cambio. Factura: ${factura_id}`, usuario_nombre, `FCAMBIO-${factura_id}`]
+      );
+    }
+
+    // 4. Consultar y disminuir stock del producto nuevo
+    const [pNuevoData]: any = await conn.query(
+      "SELECT cantidad, es_servicio, permitir_venta_negativa, nombre FROM productos WHERE id = ? AND empresa_id = ? FOR UPDATE", 
+      [producto_nuevo_id, empresa_id]
+    );
+
+    if (pNuevoData.length === 0) {
+      throw new Error("El producto nuevo no existe.");
+    }
+
+    if (!pNuevoData[0].es_servicio) {
+      // 0. Consultar configuración específica de la empresa
+      const [configs]: any = await conn.query(
+        "SELECT permitir_venta_negativa FROM empresa_config WHERE empresa_id = ?", 
+        [empresa_id]
+      );
+      const permitirNegativoGlobal = configs && configs[0] ? !!configs[0].permitir_venta_negativa : true;
+      const permitirNegativoProd = !!pNuevoData[0].permitir_venta_negativa;
+      const stockAntesN = pNuevoData[0].cantidad;
+
+      if (!permitirNegativoGlobal && !permitirNegativoProd && stockAntesN < cantidad_nueva) {
+        throw new Error(`Stock insuficiente para: ${pNuevoData[0].nombre}. Disponible: ${stockAntesN}`);
+      }
+
+      await conn.query("UPDATE productos SET cantidad = cantidad - ? WHERE id = ? AND empresa_id = ?", [cantidad_nueva, producto_nuevo_id, empresa_id]);
+      
+      await conn.query(
+        "INSERT INTO kardex (producto_id, empresa_id, tipo_movimiento, cantidad_antes, cantidad_modificada, cantidad_despues, motivo, usuario_nombre, referencia) VALUES (?, ?, 'SALIDA_CAMBIO', ?, ?, ?, ?, ?, ?)",
+        [producto_nuevo_id, empresa_id, stockAntesN, -cantidad_nueva, stockAntesN - cantidad_nueva, `Entrega por cambio. Factura: ${factura_id}`, usuario_nombre, `FCAMBIO-${factura_id}`]
+      );
+    }
+
+    // 5. Registrar el cambio
+    await conn.query(
+      `INSERT INTO cambios_factura 
+      (empresa_id, factura_original_id, cajero_id, producto_devuelto_id, producto_nuevo_id, cantidad_devuelta, cantidad_nueva, valor_original, valor_nuevo, saldo_adicional, metodo_pago) 
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [empresa_id, factura_id, cId, producto_devuelto_id, producto_nuevo_id, cantidad_devuelta, cantidad_nueva, valor_original, valor_nuevo, saldo_adicional, metodo_pago || 'Efectivo']
+    );
+
+    await conn.commit();
+    res.json({ success: true, message: "Cambio registrado correctamente. El saldo adicional se ha asignado a la caja del cajero actual." });
+
+  } catch (error: any) {
+    if (conn) await conn.rollback();
+    console.error("Error al registrar cambio:", error);
+    res.status(500).json({ error: "No se pudo registrar el cambio: " + error.message });
   } finally {
     if (conn) conn.release();
   }

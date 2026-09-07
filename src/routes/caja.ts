@@ -21,50 +21,55 @@ router.get("/estado-actual", verifyTokenAndTenant, (req: any, res: any) => {
       return res.status(500).json({ error: "Error al consultar caja" });
     }
 
-    
+
     if (results.length === 0) {
       return res.json({ abierta: false });
     }
 
     const sesion = results[0];
-    
+
     // Calcular ventas desde la apertura
     // Necesitamos el cajero_id asociado al usuario para filtrar facturas_venta
     // El cajero_id viene en el token (req.user.cajero_id)
     const cajero_id = req.user.cajero_id;
 
-      const queryVentas = `
+    const queryVentas = `
         SELECT 
           SUM(total_bruto) as total_ventas,
           SUM(efectivo) as total_efectivo,
-          SUM(transferencia) as total_transferencia
+          SUM(IF(metodo_pago = 'Transferencia' OR metodo_pago = 'Mixto', transferencia, 0)) as total_transferencia,
+          SUM(IF(metodo_pago = 'Tarjeta', transferencia, 0)) as total_tarjeta,
+          SUM(IF(metodo_pago = 'Addi', transferencia, 0)) as total_addi
         FROM (
           -- Ventas directas
-          SELECT total as total_bruto, pago_efectivo as efectivo, pago_transferencia as transferencia, fecha, cajero_id, empresa_id FROM facturas_venta
+          SELECT total as total_bruto, pago_efectivo as efectivo, pago_transferencia as transferencia, metodo_pago, fecha, cajero_id, empresa_id FROM facturas_venta
           UNION ALL
           -- Ventas electrónicas
-          SELECT total as total_bruto, pago_efectivo as efectivo, pago_transferencia as transferencia, fecha_emision as fecha, cajero_id, empresa_id FROM facturas_electronicas
+          SELECT total as total_bruto, pago_efectivo as efectivo, pago_transferencia as transferencia, metodo_pago, fecha_emision as fecha, cajero_id, empresa_id FROM facturas_electronicas
           UNION ALL
           -- Abonos y pagos de separados (Layaway)
-          SELECT monto as total_bruto, pago_efectivo as efectivo, pago_transferencia as transferencia, fecha_pago as fecha, cajero_id, empresa_id FROM abonos_separados
+          SELECT monto as total_bruto, pago_efectivo as efectivo, pago_transferencia as transferencia, metodo_pago, fecha_pago as fecha, cajero_id, empresa_id FROM abonos_separados
+          UNION ALL
+          -- Saldos a favor por cambios de producto
+          SELECT saldo_adicional as total_bruto, IF(metodo_pago='Efectivo', saldo_adicional, 0) as efectivo, IF(metodo_pago!='Efectivo', saldo_adicional, 0) as transferencia, metodo_pago, fecha, cajero_id, empresa_id FROM cambios_factura WHERE saldo_adicional > 0
         ) AS todas_ventas
         WHERE empresa_id = ? 
         ${cajero_id ? "AND cajero_id = ?" : ""}
         AND fecha >= ?
       `;
 
-      const params = cajero_id ? [empresa_id, cajero_id, sesion.fecha_apertura] : [empresa_id, sesion.fecha_apertura];
+    const params = cajero_id ? [empresa_id, cajero_id, sesion.fecha_apertura] : [empresa_id, sesion.fecha_apertura];
 
-      connection.query(queryVentas, params, (errV: any, resultsV: any[]) => {
-        if (errV) {
-          console.error("Error al calcular ventas:", errV);
-          return res.status(500).json({ error: "Error al calcular ventas" });
-        }
+    connection.query(queryVentas, params, (errV: any, resultsV: any[]) => {
+      if (errV) {
+        console.error("Error al calcular ventas:", errV);
+        return res.status(500).json({ error: "Error al calcular ventas" });
+      }
 
-        const totals = resultsV[0];
-        
-        // Consultar movimientos manuales (Ingresos y Salidas)
-        const queryMovs = `
+      const totals = resultsV[0];
+
+      // Consultar movimientos manuales (Ingresos y Salidas)
+      const queryMovs = `
           SELECT 
             SUM(IF(tipo = 'Ingreso', ABS(monto), 0)) as total_ingresos,
             SUM(IF(tipo = 'Salida', ABS(monto), 0)) as total_salidas
@@ -72,32 +77,34 @@ router.get("/estado-actual", verifyTokenAndTenant, (req: any, res: any) => {
           WHERE sesion_caja_id = ? AND empresa_id = ?
         `;
 
-        connection.query(queryMovs, [sesion.id, empresa_id], (errM: any, resultsM: any[]) => {
-          if (errM) {
-            console.error("Error al calcular movimientos:", errM);
-            return res.status(500).json({ error: "Error al calcular movimientos" });
+      connection.query(queryMovs, [sesion.id, empresa_id], (errM: any, resultsM: any[]) => {
+        if (errM) {
+          console.error("Error al calcular movimientos:", errM);
+          return res.status(500).json({ error: "Error al calcular movimientos" });
+        }
+
+        const movs = resultsM[0];
+        const ingresos = parseFloat(movs.total_ingresos || 0);
+        const salidas = parseFloat(movs.total_salidas || 0);
+        const total_efectivo_ventas = parseFloat(totals.total_efectivo || 0);
+
+        res.json({
+          abierta: true,
+          sesion: {
+            ...sesion,
+            total_ventas: totals.total_ventas || 0,
+            total_efectivo: total_efectivo_ventas,
+            total_transferencia: totals.total_transferencia || 0,
+            total_tarjeta: totals.total_tarjeta || 0,
+            total_addi: totals.total_addi || 0,
+            total_ingresos: ingresos,
+            total_salidas: salidas,
+            // FÓRMULA MAESTRA: Base + Efectivo de Ventas y Abonos + Ajustes Positivos - Ajustes Negativos
+            valor_esperado: parseFloat(sesion.base_caja) + total_efectivo_ventas + ingresos - salidas
           }
-
-          const movs = resultsM[0];
-          const ingresos = parseFloat(movs.total_ingresos || 0);
-          const salidas = parseFloat(movs.total_salidas || 0);
-          const total_efectivo_ventas = parseFloat(totals.total_efectivo || 0);
-
-          res.json({
-            abierta: true,
-            sesion: {
-              ...sesion,
-              total_ventas: totals.total_ventas || 0,
-              total_efectivo: total_efectivo_ventas,
-              total_transferencia: totals.total_transferencia || 0,
-              total_ingresos: ingresos,
-              total_salidas: salidas,
-              // FÓRMULA MAESTRA: Base + Efectivo de Ventas y Abonos + Ajustes Positivos - Ajustes Negativos
-              valor_esperado: parseFloat(sesion.base_caja) + total_efectivo_ventas + ingresos - salidas
-            }
-          });
         });
       });
+    });
   });
 });
 
@@ -138,7 +145,7 @@ router.post("/apertura", verifyTokenAndTenant, (req: any, res: any) => {
         }
         // Notificar por Socket
         if (req.io) {
-           req.io.to(`empresa_${empresa_id}`).emit('caja_abierta', { usuario_id, base_caja });
+          req.io.to(`empresa_${empresa_id}`).emit('caja_abierta', { usuario_id, base_caja });
         }
         res.json({ success: true, message: "Caja abierta correctamente" });
       });
@@ -172,13 +179,17 @@ router.post("/cierre", verifyTokenAndTenant, (req: any, res: any) => {
         SELECT 
           SUM(total_bruto) as total_ventas,
           SUM(efectivo) as total_efectivo,
-          SUM(transferencia) as total_transferencia
+          SUM(IF(metodo_pago = 'Transferencia' OR metodo_pago = 'Mixto', transferencia, 0)) as total_transferencia,
+          SUM(IF(metodo_pago = 'Tarjeta', transferencia, 0)) as total_tarjeta,
+          SUM(IF(metodo_pago = 'Addi', transferencia, 0)) as total_addi
         FROM (
-          SELECT total as total_bruto, pago_efectivo as efectivo, pago_transferencia as transferencia, fecha, cajero_id, empresa_id FROM facturas_venta
+          SELECT total as total_bruto, pago_efectivo as efectivo, pago_transferencia as transferencia, metodo_pago, fecha, cajero_id, empresa_id FROM facturas_venta
           UNION ALL
-          SELECT total as total_bruto, pago_efectivo as efectivo, pago_transferencia as transferencia, fecha_emision as fecha, cajero_id, empresa_id FROM facturas_electronicas
+          SELECT total as total_bruto, pago_efectivo as efectivo, pago_transferencia as transferencia, metodo_pago, fecha_emision as fecha, cajero_id, empresa_id FROM facturas_electronicas
           UNION ALL
-          SELECT monto as total_bruto, pago_efectivo as efectivo, pago_transferencia as transferencia, fecha_pago as fecha, cajero_id, empresa_id FROM abonos_separados
+          SELECT monto as total_bruto, pago_efectivo as efectivo, pago_transferencia as transferencia, metodo_pago, fecha_pago as fecha, cajero_id, empresa_id FROM abonos_separados
+          UNION ALL
+          SELECT saldo_adicional as total_bruto, IF(metodo_pago='Efectivo', saldo_adicional, 0) as efectivo, IF(metodo_pago!='Efectivo', saldo_adicional, 0) as transferencia, metodo_pago, fecha, cajero_id, empresa_id FROM cambios_factura WHERE saldo_adicional > 0
         ) AS todas_ventas
         WHERE empresa_id = ? 
         ${cajero_id ? "AND cajero_id = ?" : ""}
@@ -194,6 +205,8 @@ router.post("/cierre", verifyTokenAndTenant, (req: any, res: any) => {
         const total_ventas = totals.total_ventas || 0;
         const total_efectivo = totals.total_efectivo || 0;
         const total_transferencia = totals.total_transferencia || 0;
+        const total_tarjeta = totals.total_tarjeta || 0;
+        const total_addi = totals.total_addi || 0;
 
         // Consultar movimientos manuales antes de cerrar
         const queryMovs = `
@@ -220,6 +233,8 @@ router.post("/cierre", verifyTokenAndTenant, (req: any, res: any) => {
               total_ventas = ?,
               total_efectivo = ?,
               total_transferencia = ?,
+              total_tarjeta = ?,
+              total_addi = ?,
               total_ingresos = ?,
               total_salidas = ?,
               dinero_reportado = ?,
@@ -228,18 +243,20 @@ router.post("/cierre", verifyTokenAndTenant, (req: any, res: any) => {
             WHERE id = ?
           `;
 
-          connection.query(queryUpdate, [total_ventas, total_efectivo, total_transferencia, ingresos, salidas, dinero_reportado, diferencia, sesion.id], (errU: any) => {
+          connection.query(queryUpdate, [total_ventas, total_efectivo, total_transferencia, total_tarjeta, total_addi, ingresos, salidas, dinero_reportado, diferencia, sesion.id], (errU: any) => {
             if (errU) return res.status(500).json({ error: "Error al cerrar caja" });
             // Notificar por Socket
             if (req.io) {
-               req.io.to(`empresa_${empresa_id}`).emit('caja_cerrada', { usuario_id, resumen: { total_ventas, dinero_reportado, diferencia } });
+              req.io.to(`empresa_${empresa_id}`).emit('caja_cerrada', { usuario_id, resumen: { total_ventas, dinero_reportado, diferencia } });
             }
-            res.json({ 
-              success: true, 
+            res.json({
+              success: true,
               resumen: {
                 total_ventas,
                 total_efectivo,
                 total_transferencia,
+                total_tarjeta,
+                total_addi,
                 total_ingresos: ingresos,
                 total_salidas: salidas,
                 valor_esperado,
@@ -318,7 +335,7 @@ router.post("/movimiento", verifyTokenAndTenant, (req: any, res: any) => {
     }
     // Notificar por Socket
     if (req.io) {
-       req.io.to(`empresa_${empresa_id}`).emit('caja_movimiento', { tipo, monto, descripcion });
+      req.io.to(`empresa_${empresa_id}`).emit('caja_movimiento', { tipo, monto, descripcion });
     }
     res.json({ success: true, message: "Movimiento registrado con éxito" });
   });

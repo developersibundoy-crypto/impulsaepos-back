@@ -66,9 +66,32 @@ router.post("/emitir", async (req: any, res: any) => {
     // --- NUEVO: Obtener porcentaje de comisión del cajero ---
     let percComision = 0;
     if (cId) {
-      const [cData]: any = await conn.query("SELECT paga_comisiones, porcentaje_comision FROM cajeros WHERE id = ?", [cId]);
+      const [cData]: any = await conn.query("SELECT paga_comisiones, porcentaje_comision_base, meta_comision, porcentaje_comision_meta FROM cajeros WHERE id = ?", [cId]);
       if (cData.length > 0 && cData[0].paga_comisiones) {
-        percComision = parseFloat(cData[0].porcentaje_comision) || 0;
+        const cashier = cData[0];
+        const meta = parseFloat(cashier.meta_comision) || 0;
+        
+        if (meta > 0) {
+          const [ventasMes]: any = await conn.query(`
+            SELECT COALESCE(SUM(total), 0) as total_mes FROM facturas_venta 
+            WHERE cajero_id = ? AND empresa_id = ? AND MONTH(fecha) = MONTH(CURRENT_DATE()) AND YEAR(fecha) = YEAR(CURRENT_DATE())
+          `, [cId, empresa_id]);
+          const [ventasElec]: any = await conn.query(`
+            SELECT COALESCE(SUM(total), 0) as total_mes FROM facturas_electronicas 
+            WHERE cajero_id = ? AND empresa_id = ? AND MONTH(fecha_emision) = MONTH(CURRENT_DATE()) AND YEAR(fecha_emision) = YEAR(CURRENT_DATE())
+          `, [cId, empresa_id]);
+          
+          const acumulado = parseFloat(ventasMes[0].total_mes) + parseFloat(ventasElec[0].total_mes);
+          const totalVentaActual = parseFloat(total) || 0;
+          
+          if (acumulado + totalVentaActual > meta) {
+             percComision = parseFloat(cashier.porcentaje_comision_meta) || 0;
+          } else {
+             percComision = parseFloat(cashier.porcentaje_comision_base) || 0;
+          }
+        } else {
+          percComision = parseFloat(cashier.porcentaje_comision_base) || 0;
+        }
       }
     }
 

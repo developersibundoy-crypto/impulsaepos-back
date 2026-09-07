@@ -57,7 +57,7 @@ router.get("/dashboard", (req: any, res: any) => {
 
   const q1 = `
     SELECT 
-      COALESCE(SUM(factura_total), 0) as total_ingresos, 
+      COALESCE(SUM(factura_total), 0) + (SELECT COALESCE(SUM(saldo_adicional), 0) FROM cambios_factura WHERE ${whereSQL.replace(/f\./g, '')} AND saldo_adicional > 0) as total_ingresos, 
       COALESCE(SUM(factura_utilidad), 0) as total_utilidad_global,
       COALESCE(SUM(factura_iva), 0) as total_iva,
       COUNT(DISTINCT CONCAT(tipo_factura, '-', factura_id)) as total_ventas 
@@ -133,13 +133,21 @@ router.get("/dashboard", (req: any, res: any) => {
   const q3Where = q3WhereClauses.join(" AND ");
 
   const q3 = `
-    SELECT c.nombre, 
-           COUNT(DISTINCT CONCAT(f.tipo_factura, '-', f.id)) as cantidad_facturas, 
-           COALESCE(SUM(v.cantidad * v.precio_unitario), 0) as dinero_recaudado,
-           COALESCE(SUM(CASE WHEN f.metodo_pago = 'Efectivo' THEN (v.cantidad * v.precio_unitario) WHEN f.metodo_pago = 'Mixto' THEN (f.pago_efectivo * (v.cantidad * v.precio_unitario / NULLIF(f.total, 0))) ELSE 0 END), 0) as dinero_efectivo,
-           COALESCE(SUM(CASE WHEN f.metodo_pago IN ('Tarjeta', 'Transferencia') THEN (v.cantidad * v.precio_unitario) WHEN f.metodo_pago = 'Mixto' THEN (f.pago_transferencia * (v.cantidad * v.precio_unitario / NULLIF(f.total, 0))) ELSE 0 END), 0) as dinero_transferencia,
+    SELECT 
+           c.nombre,
+           COUNT(DISTINCT CONCAT(f.tipo_factura, '-', f.id)) as cantidad_facturas,
+           COALESCE(SUM(v.cantidad * v.precio_unitario), 0) + COALESCE(MAX(cf.extra_recaudado), 0) as dinero_recaudado,
+           COALESCE(SUM(CASE WHEN f.metodo_pago = 'Efectivo' THEN (v.cantidad * v.precio_unitario) ELSE 0 END), 0) + COALESCE(MAX(cf.extra_recaudado), 0) as dinero_efectivo,
+           COALESCE(SUM(CASE WHEN f.metodo_pago = 'Transferencia' THEN (v.cantidad * v.precio_unitario) ELSE 0 END), 0) as dinero_transferencia,
+           COALESCE(SUM(CASE WHEN f.metodo_pago = 'Tarjeta' THEN (v.cantidad * v.precio_unitario) ELSE 0 END), 0) as dinero_tarjeta,
+           COALESCE(SUM(CASE WHEN f.metodo_pago = 'Addi' THEN (v.cantidad * v.precio_unitario) ELSE 0 END), 0) as dinero_addi,
+           COALESCE(SUM(CASE WHEN f.metodo_pago = 'Mixto' THEN (f.pago_efectivo * (v.cantidad * v.precio_unitario / NULLIF(f.total, 0))) ELSE 0 END), 0) as dinero_mixto_efectivo,
+           COALESCE(SUM(CASE WHEN f.metodo_pago = 'Mixto' THEN (f.pago_transferencia * (v.cantidad * v.precio_unitario / NULLIF(f.total, 0))) ELSE 0 END), 0) as dinero_mixto_transferencia,
            COALESCE(SUM(v.cantidad * (v.precio_unitario - COALESCE(NULLIF(v.costo_unitario, 0), p.precio_compra, 0))), 0) as total_utilidad
     FROM cajeros c
+    LEFT JOIN (
+      SELECT cajero_id, COALESCE(SUM(saldo_adicional), 0) as extra_recaudado FROM cambios_factura WHERE ${q3Where.replace(/f\./g, '')} AND saldo_adicional > 0 GROUP BY cajero_id
+    ) cf ON c.id = cf.cajero_id
     JOIN (
       SELECT id, fecha, empresa_id, cajero_id, cliente_id, total, metodo_pago, pago_efectivo, pago_transferencia, 'POS' AS tipo_factura FROM facturas_venta
       UNION ALL
@@ -188,9 +196,9 @@ router.get("/dashboard", (req: any, res: any) => {
   };
 
   Promise.all([
-    runQuery(q1, params),
+    runQuery(q1, [...params, ...params]),
     runQuery(q2, params),
-    runQuery(q3, q3Params),
+    runQuery(q3, [...q3Params, ...q3Params]),
     runQuery(q4, params)
   ])
     .then(([res1, res2, res3, res4]: any) => {
@@ -716,6 +724,106 @@ router.get("/financiero", async (req: any, res: any) => {
     console.error("Error Financial Dashboard:", error);
     res.status(500).json({ error: "Error obteniendo datos financieros" });
   }
+});
+
+// --- NUEVO: REPORTE DE ABONOS DE SEPARADOS ---
+router.get("/abonos-separados", (req: any, res: any) => {
+  const empresa_id = req.user.empresa_id;
+  // Use the username from the token as fallback for old records
+  const fallbackUsername = req.user.username || "Usuario Actual"; 
+  const { cajeroId, startDate, endDate } = req.query;
+
+  let whereClauses = ["a.empresa_id = ?"];
+  let params: any[] = [empresa_id];
+
+  if (cajeroId) {
+    whereClauses.push("a.cajero_id = ?");
+    params.push(cajeroId);
+  }
+  if (startDate) {
+    whereClauses.push("a.fecha_pago >= ?");
+    params.push(`${startDate} 00:00:00`);
+  }
+  if (endDate) {
+    whereClauses.push("a.fecha_pago <= ?");
+    params.push(`${endDate} 23:59:59`);
+  }
+
+  const whereSQL = whereClauses.join(" AND ");
+
+  // Query 1: Totals
+  const qTotals = `
+    SELECT 
+      COALESCE(SUM(a.monto), 0) as total_abonos,
+      COUNT(a.id) as cantidad_abonos
+    FROM abonos_separados a
+    WHERE ${whereSQL}
+  `;
+
+  // Query 2: Grouped by Cajero
+  const qByCajero = `
+    SELECT 
+      COALESCE(c.nombre, ?) as nombre,
+      COALESCE(SUM(a.monto), 0) as dinero_recaudado,
+      COUNT(a.id) as cantidad_abonos
+    FROM abonos_separados a
+    LEFT JOIN cajeros c ON a.cajero_id = c.id
+    WHERE ${whereSQL}
+    GROUP BY c.id, nombre
+    ORDER BY dinero_recaudado DESC
+  `;
+
+  // Query 3: Details
+  const qDetails = `
+    SELECT 
+      a.id,
+      a.fecha_pago,
+      a.monto,
+      a.metodo_pago,
+      a.pago_efectivo,
+      a.pago_transferencia,
+      COALESCE(c.nombre, ?) as cajero,
+      cl.nombre as cliente,
+      cl.id as cliente_id,
+      s.id as separado_id
+    FROM abonos_separados a
+    LEFT JOIN cajeros c ON a.cajero_id = c.id
+    JOIN separados s ON a.separado_id = s.id
+    LEFT JOIN clientes cl ON s.cliente_id = cl.id
+    WHERE ${whereSQL}
+    ORDER BY a.fecha_pago DESC
+  `;
+
+  const runQuery = (query: string, queryParams: any[]) => {
+    return new Promise((resolve, reject) => {
+      connection.query(query, queryParams, (err, results) => {
+        if (err) reject(err);
+        else resolve(results);
+      });
+    });
+  };
+
+  // Add the fallback parameter to the grouped and detailed queries
+  const paramsByCajero = [fallbackUsername, ...params];
+  const paramsDetails = [fallbackUsername, ...params];
+
+  Promise.all([
+    runQuery(qTotals, params),
+    runQuery(qByCajero, paramsByCajero),
+    runQuery(qDetails, paramsDetails)
+  ])
+    .then(([totals, byCajero, details]: any) => {
+      res.json({
+        total_abonos: totals[0].total_abonos,
+        cantidad_abonos: totals[0].cantidad_abonos,
+        abonosPorCajero: byCajero,
+        detalleAbonos: details
+      });
+    })
+    .catch(err => {
+      console.error("Error Abonos Separados Report:", err);
+      res.status(500).json({ error: "Error obteniendo reporte de abonos" });
+    });
 });
 
 export default router;

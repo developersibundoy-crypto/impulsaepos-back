@@ -68,7 +68,7 @@ router.get("/", async (req: any, res: any) => {
         documento: cajero.documento,
         salario_base,
         salario_pagado: pagoRegistrado ? parseFloat(pagoRegistrado.salario_base) : null,
-        porcentaje_comision: cajero.porcentaje_comision,
+        porcentaje_comision: cajero.porcentaje_comision_base,
         comisiones: pagoRegistrado ? parseFloat(pagoRegistrado.comisiones) : comisiones,
         total_a_pagar: pagoRegistrado ? parseFloat(pagoRegistrado.total_pagado) : total_a_pagar,
         estado,

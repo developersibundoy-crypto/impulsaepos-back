@@ -65,9 +65,9 @@ async function test() {
 
     let percComision = 0;
     if (cId) {
-      const [cData] = await conn.query("SELECT paga_comisiones, porcentaje_comision FROM cajeros WHERE id = ?", [cId]);
+      const [cData] = await conn.query("SELECT paga_comisiones, porcentaje_comision_base FROM cajeros WHERE id = ?", [cId]);
       if (cData.length > 0 && cData[0].paga_comisiones) {
-        percComision = parseFloat(cData[0].porcentaje_comision) || 0;
+        percComision = parseFloat(cData[0].porcentaje_comision_base) || 0;
       }
     }
     console.log("percComision:", percComision);

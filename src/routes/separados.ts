@@ -24,6 +24,24 @@ router.get("/", (req: any, res: any) => {
   });
 });
 
+// GET separados by cliente_id
+router.get("/cliente/:cliente_id", (req: any, res: any) => {
+  const empresa_id = req.user.empresa_id;
+  const { cliente_id } = req.params;
+  const sql = `
+    SELECT s.*, c.nombre as cliente_nombre, c.documento as cliente_documento, ca.nombre as cajero_nombre
+    FROM separados s
+    LEFT JOIN clientes c ON s.cliente_id = c.id
+    LEFT JOIN cajeros ca ON s.cajero_id = ca.id
+    WHERE s.empresa_id = ? AND s.cliente_id = ?
+    ORDER BY s.fecha_creacion DESC
+  `;
+  pool.query(sql, [empresa_id, cliente_id], (err: any, results: any) => {
+    if (err) return res.status(500).json({ error: "Error obteniendo separados del cliente" });
+    res.json(results);
+  });
+});
+
 // GET one separado and its abonos
 router.get("/:id", (req: any, res: any) => {
   const empresa_id = req.user.empresa_id;

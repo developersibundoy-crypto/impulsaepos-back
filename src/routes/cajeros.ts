@@ -26,7 +26,7 @@ router.get("/", (req: any, res: any) => {
 // Crear cajero y usuario asociado
 router.post("/", async (req: any, res: any) => {
   const empresa_id = req.user.empresa_id;
-  const { nombre, documento, telefono, direccion, fecha_contrato, salario, paga_comisiones, porcentaje_comision, username, password, permisos } = req.body;
+  const { nombre, documento, telefono, direccion, fecha_contrato, salario, paga_comisiones, porcentaje_comision_base, meta_comision, porcentaje_comision_meta, username, password, permisos } = req.body;
   if (!nombre) return res.status(400).json({ error: "Nombre es requerido" });
 
   const promisePool = connection.promise();
@@ -37,11 +37,11 @@ router.post("/", async (req: any, res: any) => {
 
     // 1. Insertar en cajeros
     const queryCajero = `
-      INSERT INTO cajeros (empresa_id, nombre, documento, telefono, direccion, fecha_contrato, salario, paga_comisiones, porcentaje_comision) 
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO cajeros (empresa_id, nombre, documento, telefono, direccion, fecha_contrato, salario, paga_comisiones, porcentaje_comision_base, meta_comision, porcentaje_comision_meta) 
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `;
     const [resCajero]: any = await conn.query(queryCajero, [
-      empresa_id, nombre, documento || '', telefono || '', direccion || '', fecha_contrato || null, salario || 0, paga_comisiones ? 1 : 0, porcentaje_comision || 0
+      empresa_id, nombre, documento || '', telefono || '', direccion || '', fecha_contrato || null, salario || 0, paga_comisiones ? 1 : 0, porcentaje_comision_base || 0, meta_comision || 0, porcentaje_comision_meta || 0
     ]);
     const cajero_id = resCajero.insertId;
 
@@ -75,7 +75,7 @@ router.post("/", async (req: any, res: any) => {
 // Actualizar cajero y usuario
 router.put("/:id", async (req: any, res: any) => {
   const empresa_id = req.user.empresa_id;
-  const { nombre, documento, telefono, direccion, fecha_contrato, salario, paga_comisiones, porcentaje_comision, username, password, permisos } = req.body;
+  const { nombre, documento, telefono, direccion, fecha_contrato, salario, paga_comisiones, porcentaje_comision_base, meta_comision, porcentaje_comision_meta, username, password, permisos } = req.body;
   const cajero_id = req.params.id;
 
   if (!nombre) return res.status(400).json({ error: "Nombre es requerido" });
@@ -88,11 +88,11 @@ router.put("/:id", async (req: any, res: any) => {
 
     // 1. Actualizar cajero
     const query = `
-      UPDATE cajeros SET nombre = ?, documento = ?, telefono = ?, direccion = ?, fecha_contrato = ?, salario = ?, paga_comisiones = ?, porcentaje_comision = ?
+      UPDATE cajeros SET nombre = ?, documento = ?, telefono = ?, direccion = ?, fecha_contrato = ?, salario = ?, paga_comisiones = ?, porcentaje_comision_base = ?, meta_comision = ?, porcentaje_comision_meta = ?
       WHERE id = ? AND empresa_id = ?
     `;
     await conn.query(query, [
-      nombre, documento || '', telefono || '', direccion || '', fecha_contrato || null, salario || 0, paga_comisiones ? 1 : 0, porcentaje_comision || 0, cajero_id, empresa_id
+      nombre, documento || '', telefono || '', direccion || '', fecha_contrato || null, salario || 0, paga_comisiones ? 1 : 0, porcentaje_comision_base || 0, meta_comision || 0, porcentaje_comision_meta || 0, cajero_id, empresa_id
     ]);
 
     if (username) {
