@@ -27,25 +27,43 @@ router.get("/dashboard", (req: any, res: any) => {
   let whereClauses = ["f.empresa_id = ?"];
   let params: any[] = [empresa_id];
 
+  let whereCambios = ["c.empresa_id = ?"];
+  let paramsCambios: any[] = [empresa_id];
+
   if (cajeroId) {
     whereClauses.push("f.cajero_id = ?");
     params.push(cajeroId);
+
+    whereCambios.push("c.cajero_id = ?");
+    paramsCambios.push(cajeroId);
   }
   if (categoria) {
     whereClauses.push("p.categoria = ?");
     params.push(categoria);
+
+    whereCambios.push("p.categoria = ?");
+    paramsCambios.push(categoria);
   }
   if (es_servicio !== undefined && es_servicio !== "") {
     whereClauses.push("p.es_servicio = ?");
     params.push(es_servicio === 'true' || es_servicio === '1' ? 1 : 0);
+
+    whereCambios.push("p.es_servicio = ?");
+    paramsCambios.push(es_servicio === 'true' || es_servicio === '1' ? 1 : 0);
   }
   if (startDate) {
     whereClauses.push("f.fecha >= ?");
     params.push(`${startDate} 00:00:00`);
+
+    whereCambios.push("c.fecha >= ?");
+    paramsCambios.push(`${startDate} 00:00:00`);
   }
   if (endDate) {
     whereClauses.push("f.fecha <= ?");
     params.push(`${endDate} 23:59:59`);
+
+    whereCambios.push("c.fecha <= ?");
+    paramsCambios.push(`${endDate} 23:59:59`);
   }
   if (tipo_factura === "POS") {
     whereClauses.push("f.tipo_factura = 'POS'");
@@ -54,10 +72,11 @@ router.get("/dashboard", (req: any, res: any) => {
   }
 
   const whereSQL = whereClauses.join(" AND ");
+  const whereSQLCambios = whereCambios.join(" AND ");
 
   const q1 = `
     SELECT 
-      COALESCE(SUM(factura_total), 0) + (SELECT COALESCE(SUM(saldo_adicional), 0) FROM cambios_factura WHERE ${whereSQL.replace(/f\./g, '')} AND saldo_adicional > 0) as total_ingresos, 
+      COALESCE(SUM(factura_total), 0) + (SELECT COALESCE(SUM(c.saldo_adicional), 0) FROM cambios_factura c LEFT JOIN productos p ON c.producto_nuevo_id = p.id WHERE ${whereSQLCambios} AND c.saldo_adicional > 0) as total_ingresos, 
       COALESCE(SUM(factura_utilidad), 0) as total_utilidad_global,
       COALESCE(SUM(factura_iva), 0) as total_iva,
       COUNT(DISTINCT CONCAT(tipo_factura, '-', factura_id)) as total_ventas 
@@ -104,34 +123,6 @@ router.get("/dashboard", (req: any, res: any) => {
     LIMIT 5
   `;
 
-  // Q3: RENDIMIENTO CAJEROS (Filtrado Estricto por Categoría y Fecha)
-  let q3Params: any[] = [empresa_id];
-  let q3WhereClauses = ["f.empresa_id = ?"];
-
-  if (cajeroId) {
-    q3WhereClauses.push("f.cajero_id = ?");
-    q3Params.push(cajeroId);
-  }
-  if (startDate) {
-    q3WhereClauses.push("f.fecha >= ?");
-    q3Params.push(`${startDate} 00:00:00`);
-  }
-  if (endDate) {
-    q3WhereClauses.push("f.fecha <= ?");
-    q3Params.push(`${endDate} 23:59:59`);
-  }
-  if (categoria) {
-    q3WhereClauses.push("p.categoria = ?");
-    q3Params.push(categoria);
-  }
-  if (tipo_factura === "POS") {
-    q3WhereClauses.push("f.tipo_factura = 'POS'");
-  } else if (tipo_factura === "ELECTRONICA") {
-    q3WhereClauses.push("f.tipo_factura = 'ELECTRONICA'");
-  }
-
-  const q3Where = q3WhereClauses.join(" AND ");
-
   const q3 = `
     SELECT 
            c.nombre,
@@ -146,7 +137,7 @@ router.get("/dashboard", (req: any, res: any) => {
            COALESCE(SUM(v.cantidad * (v.precio_unitario - COALESCE(NULLIF(v.costo_unitario, 0), p.precio_compra, 0))), 0) as total_utilidad
     FROM cajeros c
     LEFT JOIN (
-      SELECT cajero_id, COALESCE(SUM(saldo_adicional), 0) as extra_recaudado FROM cambios_factura WHERE ${q3Where.replace(/f\./g, '')} AND saldo_adicional > 0 GROUP BY cajero_id
+      SELECT c.cajero_id, COALESCE(SUM(c.saldo_adicional), 0) as extra_recaudado FROM cambios_factura c LEFT JOIN productos p ON c.producto_nuevo_id = p.id WHERE ${whereSQLCambios} AND c.saldo_adicional > 0 GROUP BY c.cajero_id
     ) cf ON c.id = cf.cajero_id
     JOIN (
       SELECT id, fecha, empresa_id, cajero_id, cliente_id, total, metodo_pago, pago_efectivo, pago_transferencia, 'POS' AS tipo_factura FROM facturas_venta
@@ -159,7 +150,7 @@ router.get("/dashboard", (req: any, res: any) => {
       SELECT factura_electronica_id AS factura_id, producto_id, cantidad, precio_unitario, 0 AS costo_unitario, 'ELECTRONICA' AS tipo_factura FROM ventas_electronicas
     ) v ON f.id = v.factura_id AND f.tipo_factura = v.tipo_factura
     JOIN productos p ON v.producto_id = p.id
-    WHERE ${q3Where}
+    WHERE ${whereSQL}
     GROUP BY c.id
     ORDER BY dinero_recaudado DESC
   `;
@@ -196,9 +187,9 @@ router.get("/dashboard", (req: any, res: any) => {
   };
 
   Promise.all([
-    runQuery(q1, [...params, ...params]),
+    runQuery(q1, [...paramsCambios, ...params]),
     runQuery(q2, params),
-    runQuery(q3, [...q3Params, ...q3Params]),
+    runQuery(q3, [...paramsCambios, ...params]),
     runQuery(q4, params)
   ])
     .then(([res1, res2, res3, res4]: any) => {
@@ -737,7 +728,7 @@ router.get("/abonos-separados", (req: any, res: any) => {
   let params: any[] = [empresa_id];
 
   if (cajeroId) {
-    whereClauses.push("a.cajero_id = ?");
+    whereClauses.push("COALESCE(a.cajero_id, s.cajero_id) = ?");
     params.push(cajeroId);
   }
   if (startDate) {
@@ -757,19 +748,22 @@ router.get("/abonos-separados", (req: any, res: any) => {
       COALESCE(SUM(a.monto), 0) as total_abonos,
       COUNT(a.id) as cantidad_abonos
     FROM abonos_separados a
+    LEFT JOIN separados s ON a.separado_id = s.id
     WHERE ${whereSQL}
   `;
 
   // Query 2: Grouped by Cajero
   const qByCajero = `
     SELECT 
-      COALESCE(c.nombre, ?) as nombre,
+      COALESCE(c.nombre, cs.nombre, ?) as nombre,
       COALESCE(SUM(a.monto), 0) as dinero_recaudado,
       COUNT(a.id) as cantidad_abonos
     FROM abonos_separados a
     LEFT JOIN cajeros c ON a.cajero_id = c.id
+    LEFT JOIN separados s ON a.separado_id = s.id
+    LEFT JOIN cajeros cs ON s.cajero_id = cs.id
     WHERE ${whereSQL}
-    GROUP BY c.id, nombre
+    GROUP BY COALESCE(c.id, cs.id), nombre
     ORDER BY dinero_recaudado DESC
   `;
 
@@ -782,16 +776,28 @@ router.get("/abonos-separados", (req: any, res: any) => {
       a.metodo_pago,
       a.pago_efectivo,
       a.pago_transferencia,
-      COALESCE(c.nombre, ?) as cajero,
+      COALESCE(c.nombre, cs.nombre, ?) as cajero,
       cl.nombre as cliente,
       cl.id as cliente_id,
       s.id as separado_id
     FROM abonos_separados a
     LEFT JOIN cajeros c ON a.cajero_id = c.id
     JOIN separados s ON a.separado_id = s.id
+    LEFT JOIN cajeros cs ON s.cajero_id = cs.id
     LEFT JOIN clientes cl ON s.cliente_id = cl.id
     WHERE ${whereSQL}
     ORDER BY a.fecha_pago DESC
+  `;
+
+  // Query 4: Categorías Proporcionales
+  const qCategorias = `
+    SELECT 
+      a.monto,
+      s.total,
+      s.detalles_json
+    FROM abonos_separados a
+    JOIN separados s ON a.separado_id = s.id
+    WHERE ${whereSQL}
   `;
 
   const runQuery = (query: string, queryParams: any[]) => {
@@ -810,14 +816,42 @@ router.get("/abonos-separados", (req: any, res: any) => {
   Promise.all([
     runQuery(qTotals, params),
     runQuery(qByCajero, paramsByCajero),
-    runQuery(qDetails, paramsDetails)
+    runQuery(qDetails, paramsDetails),
+    runQuery(qCategorias, params)
   ])
-    .then(([totals, byCajero, details]: any) => {
+    .then(([totals, byCajero, details, categoriasRaw]: any) => {
+      const categoriasMap = new Map();
+
+      categoriasRaw.forEach((row: any) => {
+         const abono_monto = Number(row.monto) || 0;
+         const separado_total = Number(row.total) || 1;
+         const items = typeof row.detalles_json === 'string' ? JSON.parse(row.detalles_json) : (row.detalles_json || []);
+         
+         items.forEach((item: any) => {
+            const cat = item.categoria || 'Sin Categoría';
+            const itemTotal = (Number(item.qty) || Number(item.cantidad) || 1) * (Number(item.precio_venta) || Number(item.precio_final) || 0);
+            const proporcion = itemTotal / separado_total;
+            const montoParaCategoria = abono_monto * proporcion;
+
+            if (categoriasMap.has(cat)) {
+               categoriasMap.get(cat).total += montoParaCategoria;
+            } else {
+               categoriasMap.set(cat, {
+                  categoria: cat,
+                  total: montoParaCategoria
+               });
+            }
+         });
+      });
+
+      const abonosPorCategoria = Array.from(categoriasMap.values()).sort((a: any, b: any) => b.total - a.total);
+
       res.json({
         total_abonos: totals[0].total_abonos,
         cantidad_abonos: totals[0].cantidad_abonos,
         abonosPorCajero: byCajero,
-        detalleAbonos: details
+        detalleAbonos: details,
+        abonosPorCategoria: abonosPorCategoria
       });
     })
     .catch(err => {
