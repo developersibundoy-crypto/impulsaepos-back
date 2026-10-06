@@ -400,7 +400,7 @@ router.put("/:id/completar", async (req: any, res: any) => {
 router.put("/:id/anular", async (req: any, res: any) => {
   const empresa_id = req.user.empresa_id;
   const { id } = req.params;
-  const { motivo } = req.body;
+  const { motivo } = req.body || {};
 
   const promisePool = pool.promise();
   const conn = await promisePool.getConnection();
