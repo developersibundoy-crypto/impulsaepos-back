@@ -184,4 +184,93 @@ router.get("/predicciones", verifyTokenAndTenant, async (req: any, res: any) => 
   }
 });
 
+// Endpoint en AI para alertas de vencimiento con umbral de días dinámico y configurable
+router.get("/proximos-vencer", verifyTokenAndTenant, async (req: any, res: any) => {
+  const empresa_id = req.user.empresa_id;
+  const promiseDb = connection.promise();
+
+  try {
+    let diasLimite = 30;
+
+    if (req.query.dias) {
+      const parsed = parseInt(req.query.dias as string, 10);
+      if (!isNaN(parsed) && parsed > 0) {
+        diasLimite = parsed;
+      }
+    } else {
+      try {
+        const [configRows]: any = await promiseDb.query(
+          "SELECT dias_alerta_vencimiento FROM empresa_config WHERE empresa_id = ?",
+          [empresa_id]
+        );
+        if (configRows && configRows.length > 0 && configRows[0].dias_alerta_vencimiento) {
+          diasLimite = Number(configRows[0].dias_alerta_vencimiento);
+        }
+      } catch (cfgErr) {
+        // En caso de que la columna aún no exista o tabla vacía
+      }
+    }
+
+    const query = `
+      SELECT id, nombre, referencia, categoria, cantidad, fecha_vencimiento,
+             DATEDIFF(fecha_vencimiento, CURDATE()) as dias_faltantes
+      FROM productos
+      WHERE empresa_id = ? 
+        AND fecha_vencimiento IS NOT NULL 
+        AND fecha_vencimiento >= CURDATE()
+        AND fecha_vencimiento <= DATE_ADD(CURDATE(), INTERVAL ? DAY)
+      ORDER BY fecha_vencimiento ASC
+    `;
+
+    const [results]: any = await promiseDb.query(query, [empresa_id, diasLimite]);
+    res.json(results);
+  } catch (err) {
+    console.error("Error fetching near expiry products in AI:", err);
+    res.status(500).json({ error: "Error al obtener productos por vencer" });
+  }
+});
+
+// Obtener la configuración de días de alerta de la empresa
+router.get("/config-vencimiento", verifyTokenAndTenant, async (req: any, res: any) => {
+  const empresa_id = req.user.empresa_id;
+  const promiseDb = connection.promise();
+  try {
+    const [rows]: any = await promiseDb.query(
+      "SELECT dias_alerta_vencimiento FROM empresa_config WHERE empresa_id = ?",
+      [empresa_id]
+    );
+    const dias = (rows && rows.length > 0 && rows[0].dias_alerta_vencimiento) ? Number(rows[0].dias_alerta_vencimiento) : 30;
+    res.json({ dias_alerta_vencimiento: dias });
+  } catch (err) {
+    res.json({ dias_alerta_vencimiento: 30 });
+  }
+});
+
+// Guardar los días de alerta fijados manualmente por el administrador
+router.post("/config-vencimiento", verifyTokenAndTenant, async (req: any, res: any) => {
+  const empresa_id = req.user.empresa_id;
+  const promiseDb = connection.promise();
+  const dias = parseInt(req.body.dias, 10);
+  if (isNaN(dias) || dias <= 0) {
+    return res.status(400).json({ error: "El número de días debe ser mayor a 0" });
+  }
+
+  try {
+    try {
+      await promiseDb.query("ALTER TABLE empresa_config ADD COLUMN dias_alerta_vencimiento INT DEFAULT 30");
+    } catch (colErr: any) {
+      // Ignorar si ya existe
+    }
+
+    await promiseDb.query(
+      "UPDATE empresa_config SET dias_alerta_vencimiento = ? WHERE empresa_id = ?",
+      [dias, empresa_id]
+    );
+    res.json({ success: true, dias_alerta_vencimiento: dias, message: "Días de alerta guardados correctamente" });
+  } catch (err: any) {
+    console.error("Error guardando dias_alerta_vencimiento:", err);
+    res.status(500).json({ error: "Error al guardar configuración de vencimiento" });
+  }
+});
+
 export default router;

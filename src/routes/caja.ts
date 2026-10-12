@@ -39,7 +39,8 @@ router.get("/estado-actual", verifyTokenAndTenant, (req: any, res: any) => {
           SUM(efectivo) as total_efectivo,
           SUM(IF(metodo_pago = 'Transferencia' OR metodo_pago = 'Mixto', transferencia, 0)) as total_transferencia,
           SUM(IF(metodo_pago = 'Tarjeta', transferencia, 0)) as total_tarjeta,
-          SUM(IF(metodo_pago = 'Addi', transferencia, 0)) as total_addi
+          SUM(IF(metodo_pago = 'Addi', transferencia, 0)) as total_addi,
+          SUM(IF(metodo_pago = 'Sistecredito', transferencia, 0)) as total_sistecredito
         FROM (
           -- Ventas directas
           SELECT total as total_bruto, pago_efectivo as efectivo, pago_transferencia as transferencia, metodo_pago, fecha, cajero_id, empresa_id FROM facturas_venta
@@ -97,6 +98,7 @@ router.get("/estado-actual", verifyTokenAndTenant, (req: any, res: any) => {
             total_transferencia: totals.total_transferencia || 0,
             total_tarjeta: totals.total_tarjeta || 0,
             total_addi: totals.total_addi || 0,
+            total_sistecredito: totals.total_sistecredito || 0,
             total_ingresos: ingresos,
             total_salidas: salidas,
             // FÓRMULA MAESTRA: Base + Efectivo de Ventas y Abonos + Ajustes Positivos - Ajustes Negativos
@@ -181,7 +183,8 @@ router.post("/cierre", verifyTokenAndTenant, (req: any, res: any) => {
           SUM(efectivo) as total_efectivo,
           SUM(IF(metodo_pago = 'Transferencia' OR metodo_pago = 'Mixto', transferencia, 0)) as total_transferencia,
           SUM(IF(metodo_pago = 'Tarjeta', transferencia, 0)) as total_tarjeta,
-          SUM(IF(metodo_pago = 'Addi', transferencia, 0)) as total_addi
+          SUM(IF(metodo_pago = 'Addi', transferencia, 0)) as total_addi,
+          SUM(IF(metodo_pago = 'Sistecredito', transferencia, 0)) as total_sistecredito
         FROM (
           SELECT total as total_bruto, pago_efectivo as efectivo, pago_transferencia as transferencia, metodo_pago, fecha, cajero_id, empresa_id FROM facturas_venta
           UNION ALL
@@ -207,6 +210,7 @@ router.post("/cierre", verifyTokenAndTenant, (req: any, res: any) => {
         const total_transferencia = totals.total_transferencia || 0;
         const total_tarjeta = totals.total_tarjeta || 0;
         const total_addi = totals.total_addi || 0;
+        const total_sistecredito = totals.total_sistecredito || 0;
 
         // Consultar movimientos manuales antes de cerrar
         const queryMovs = `
@@ -235,6 +239,7 @@ router.post("/cierre", verifyTokenAndTenant, (req: any, res: any) => {
               total_transferencia = ?,
               total_tarjeta = ?,
               total_addi = ?,
+              total_sistecredito = ?,
               total_ingresos = ?,
               total_salidas = ?,
               dinero_reportado = ?,
@@ -243,7 +248,7 @@ router.post("/cierre", verifyTokenAndTenant, (req: any, res: any) => {
             WHERE id = ?
           `;
 
-          connection.query(queryUpdate, [total_ventas, total_efectivo, total_transferencia, total_tarjeta, total_addi, ingresos, salidas, dinero_reportado, diferencia, sesion.id], (errU: any) => {
+          connection.query(queryUpdate, [total_ventas, total_efectivo, total_transferencia, total_tarjeta, total_addi, total_sistecredito, ingresos, salidas, dinero_reportado, diferencia, sesion.id], (errU: any) => {
             if (errU) return res.status(500).json({ error: "Error al cerrar caja" });
             // Notificar por Socket
             if (req.io) {
@@ -257,6 +262,7 @@ router.post("/cierre", verifyTokenAndTenant, (req: any, res: any) => {
                 total_transferencia,
                 total_tarjeta,
                 total_addi,
+                total_sistecredito,
                 total_ingresos: ingresos,
                 total_salidas: salidas,
                 valor_esperado,

@@ -78,6 +78,7 @@ connection.connect((err: any) => {
           representante_legal VARCHAR(255) DEFAULT '',
           logo LONGTEXT NULL,
           permitir_venta_negativa BOOLEAN DEFAULT 1,
+          dias_alerta_vencimiento INT DEFAULT 30,
           FOREIGN KEY (empresa_id) REFERENCES empresas_suscritas(id) ON DELETE CASCADE
         )`,
         `CREATE TABLE pagos_suscripcion (
@@ -89,6 +90,17 @@ connection.connect((err: any) => {
           metodo_pago VARCHAR(100) DEFAULT 'Wompi',
           dias_agregados INT DEFAULT 30,
           FOREIGN KEY (empresa_id) REFERENCES empresas_suscritas(id) ON DELETE CASCADE
+        )`,
+        `CREATE TABLE saas_gastos (
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          categoria VARCHAR(100) NOT NULL,
+          descripcion TEXT NOT NULL,
+          monto DECIMAL(15,2) NOT NULL,
+          fecha DATE NOT NULL,
+          metodo_pago VARCHAR(100) DEFAULT 'Transferencia',
+          comprobante_url LONGTEXT NULL,
+          creado_por VARCHAR(100) DEFAULT 'superadmin',
+          fecha_registro TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )`,
         `CREATE TABLE proveedores (
           id INT AUTO_INCREMENT PRIMARY KEY,

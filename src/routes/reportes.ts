@@ -132,6 +132,7 @@ router.get("/dashboard", (req: any, res: any) => {
            COALESCE(SUM(CASE WHEN f.metodo_pago = 'Transferencia' THEN (v.cantidad * v.precio_unitario) ELSE 0 END), 0) as dinero_transferencia,
            COALESCE(SUM(CASE WHEN f.metodo_pago = 'Tarjeta' THEN (v.cantidad * v.precio_unitario) ELSE 0 END), 0) as dinero_tarjeta,
            COALESCE(SUM(CASE WHEN f.metodo_pago = 'Addi' THEN (v.cantidad * v.precio_unitario) ELSE 0 END), 0) as dinero_addi,
+           COALESCE(SUM(CASE WHEN f.metodo_pago = 'Sistecredito' THEN (v.cantidad * v.precio_unitario) ELSE 0 END), 0) as dinero_sistecredito,
            COALESCE(SUM(CASE WHEN f.metodo_pago = 'Mixto' THEN (f.pago_efectivo * (v.cantidad * v.precio_unitario / NULLIF(f.total, 0))) ELSE 0 END), 0) as dinero_mixto_efectivo,
            COALESCE(SUM(CASE WHEN f.metodo_pago = 'Mixto' THEN (f.pago_transferencia * (v.cantidad * v.precio_unitario / NULLIF(f.total, 0))) ELSE 0 END), 0) as dinero_mixto_transferencia,
            COALESCE(SUM(v.cantidad * (v.precio_unitario - COALESCE(NULLIF(v.costo_unitario, 0), p.precio_compra, 0))), 0) as total_utilidad
@@ -387,24 +388,50 @@ router.get("/productos-vendidos", (req: any, res: any) => {
 router.get("/proximos-vencer", (req: any, res: any) => {
   const empresa_id = req.user.empresa_id;
 
-  // Seleccionamos productos con fecha de vencimiento en los próximos 30 días
-  const query = `
-    SELECT id, nombre, referencia, categoria, cantidad, fecha_vencimiento,
-           DATEDIFF(fecha_vencimiento, CURDATE()) as dias_faltantes
-    FROM productos
-    WHERE empresa_id = ? 
-      AND fecha_vencimiento IS NOT NULL 
-      AND fecha_vencimiento >= CURDATE()
-      AND fecha_vencimiento <= DATE_ADD(CURDATE(), INTERVAL 30 DAY)
-    ORDER BY fecha_vencimiento ASC
-  `;
-
-  connection.query(query, [empresa_id], (err, results) => {
-    if (err) {
-      console.error("Error fetching near expiry products:", err);
-      return res.status(500).json({ error: "Error al obtener productos por vencer" });
+  let diasLimite = 30;
+  if (req.query.dias) {
+    const parsed = parseInt(req.query.dias as string, 10);
+    if (!isNaN(parsed) && parsed > 0) {
+      diasLimite = parsed;
     }
-    res.json(results);
+  }
+
+  // Si no viene por query param, consultamos si la empresa tiene días configurados
+  const obtenerDiasEmpresa = (callback: (dias: number) => void) => {
+    if (req.query.dias) {
+      return callback(diasLimite);
+    }
+    connection.query(
+      "SELECT dias_alerta_vencimiento FROM empresa_config WHERE empresa_id = ?",
+      [empresa_id],
+      (cfgErr: any, cfgResults: any[]) => {
+        if (!cfgErr && cfgResults && cfgResults.length > 0 && cfgResults[0].dias_alerta_vencimiento) {
+          return callback(Number(cfgResults[0].dias_alerta_vencimiento));
+        }
+        return callback(30);
+      }
+    );
+  };
+
+  obtenerDiasEmpresa((diasFinales) => {
+    const query = `
+      SELECT id, nombre, referencia, categoria, cantidad, fecha_vencimiento,
+             DATEDIFF(fecha_vencimiento, CURDATE()) as dias_faltantes
+      FROM productos
+      WHERE empresa_id = ? 
+        AND fecha_vencimiento IS NOT NULL 
+        AND fecha_vencimiento >= CURDATE()
+        AND fecha_vencimiento <= DATE_ADD(CURDATE(), INTERVAL ? DAY)
+      ORDER BY fecha_vencimiento ASC
+    `;
+
+    connection.query(query, [empresa_id, diasFinales], (err, results) => {
+      if (err) {
+        console.error("Error fetching near expiry products:", err);
+        return res.status(500).json({ error: "Error al obtener productos por vencer" });
+      }
+      res.json(results);
+    });
   });
 });
 

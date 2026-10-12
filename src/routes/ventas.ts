@@ -336,6 +336,12 @@ router.get("/", verifyPermission("facturas_venta"), (req: any, res: any) => {
     whereClause += " AND f.metodo_pago = 'Efectivo'";
   } else if (filtro === "Transferencia") {
     whereClause += " AND f.metodo_pago = 'Transferencia'";
+  } else if (filtro === "Tarjeta") {
+    whereClause += " AND f.metodo_pago = 'Tarjeta'";
+  } else if (filtro === "Addi") {
+    whereClause += " AND f.metodo_pago = 'Addi'";
+  } else if (filtro === "Sistecredito") {
+    whereClause += " AND f.metodo_pago = 'Sistecredito'";
   }
 
   const countQuery = `

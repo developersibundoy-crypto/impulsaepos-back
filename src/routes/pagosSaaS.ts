@@ -254,4 +254,96 @@ router.post("/superadmin/activar-manual", verifySuperAdmin, (req: any, res: any)
   });
 });
 
+// --- MÓDULO DE GASTOS / SALIDAS DE DINERO SAAS (SUPER ADMIN) ---
+
+// Asegurar tabla de salidas de dinero SaaS
+const asegurarTablaGastosSaaS = () => {
+  const query = `
+    CREATE TABLE IF NOT EXISTS saas_gastos (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      categoria VARCHAR(100) NOT NULL,
+      descripcion TEXT NOT NULL,
+      monto DECIMAL(15,2) NOT NULL,
+      fecha DATE NOT NULL,
+      metodo_pago VARCHAR(100) DEFAULT 'Transferencia',
+      comprobante_url LONGTEXT NULL,
+      creado_por VARCHAR(100) DEFAULT 'superadmin',
+      fecha_registro TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `;
+  connection.query(query, (err) => {
+    if (err) console.error("Error asegurando tabla saas_gastos:", err);
+  });
+};
+asegurarTablaGastosSaaS();
+
+// Listar todas las salidas de dinero
+router.get("/superadmin/gastos", verifySuperAdmin, (req: any, res: any) => {
+  asegurarTablaGastosSaaS();
+  connection.query(
+    "SELECT * FROM saas_gastos ORDER BY fecha DESC, id DESC",
+    (err: any, results: any[]) => {
+      if (err) {
+        console.error("Error consultando saas_gastos:", err);
+        return res.status(500).json({ error: "Error consultando gastos SaaS" });
+      }
+      res.json(results || []);
+    }
+  );
+});
+
+// Crear nueva salida de dinero
+router.post("/superadmin/gastos", verifySuperAdmin, (req: any, res: any) => {
+  asegurarTablaGastosSaaS();
+  const { categoria, descripcion, monto, fecha, metodo_pago, comprobante_url } = req.body;
+
+  if (!categoria || !descripcion || !monto) {
+    return res.status(400).json({ error: "Categoría, descripción y monto son obligatorios." });
+  }
+
+  const montoNum = parseFloat(monto);
+  if (isNaN(montoNum) || montoNum <= 0) {
+    return res.status(400).json({ error: "El monto debe ser un valor numérico positivo." });
+  }
+
+  const fechaGasto = fecha || new Date().toISOString().slice(0, 10);
+  const user = req.user?.username || "superadmin";
+
+  const q = `
+    INSERT INTO saas_gastos (categoria, descripcion, monto, fecha, metodo_pago, comprobante_url, creado_por)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `;
+
+  connection.query(
+    q,
+    [categoria, descripcion, montoNum, fechaGasto, metodo_pago || "Transferencia", comprobante_url || null, user],
+    (err: any, result: any) => {
+      if (err) {
+        console.error("Error registrando gasto SaaS:", err);
+        return res.status(500).json({ error: "Error registrando la salida de dinero." });
+      }
+      res.json({
+        success: true,
+        id: result.insertId,
+        message: "Salida de dinero registrada exitosamente."
+      });
+    }
+  );
+});
+
+// Eliminar salida de dinero
+router.delete("/superadmin/gastos/:id", verifySuperAdmin, (req: any, res: any) => {
+  const { id } = req.params;
+  connection.query("DELETE FROM saas_gastos WHERE id = ?", [id], (err: any, result: any) => {
+    if (err) {
+      console.error("Error eliminando gasto SaaS:", err);
+      return res.status(500).json({ error: "Error al eliminar la salida de dinero." });
+    }
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ error: "Registro no encontrado." });
+    }
+    res.json({ success: true, message: "Gasto eliminado exitosamente." });
+  });
+});
+
 export default router;

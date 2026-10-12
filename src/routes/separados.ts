@@ -7,6 +7,88 @@ const router = express.Router();
 // Middleware de seguridad
 router.use(verifyTokenAndTenant);
 
+// GET historial global de abonos con filtros por fecha, búsqueda de cliente y estadísticas
+router.get("/historial-abonos", async (req: any, res: any) => {
+  const empresa_id = req.user.empresa_id;
+  const { fecha, fecha_inicio, fecha_fin, search, cliente_id } = req.query;
+
+  try {
+    let whereClause = "WHERE a.empresa_id = ?";
+    const params: any[] = [empresa_id];
+
+    if (fecha) {
+      whereClause += " AND DATE(a.fecha_pago) = ?";
+      params.push(fecha);
+    } else if (fecha_inicio && fecha_fin) {
+      whereClause += " AND DATE(a.fecha_pago) BETWEEN ? AND ?";
+      params.push(fecha_inicio, fecha_fin);
+    }
+
+    if (cliente_id) {
+      whereClause += " AND s.cliente_id = ?";
+      params.push(cliente_id);
+    }
+
+    if (search) {
+      whereClause += " AND (c.nombre LIKE ? OR c.documento LIKE ? OR CAST(s.id AS CHAR) LIKE ?)";
+      const term = `%${search}%`;
+      params.push(term, term, term);
+    }
+
+    const queryAbonos = `
+      SELECT 
+        a.id,
+        a.separado_id,
+        a.monto,
+        a.metodo_pago,
+        a.pago_efectivo,
+        a.pago_transferencia,
+        a.fecha_pago,
+        s.cliente_id,
+        c.nombre as cliente_nombre,
+        c.documento as cliente_documento,
+        c.telefono as cliente_telefono,
+        ca.nombre as cajero_nombre,
+        s.total as separado_total,
+        s.saldo_pendiente,
+        s.estado as separado_estado,
+        s.fecha_creacion as separado_fecha_creacion,
+        s.fecha_vencimiento as separado_fecha_vencimiento
+      FROM abonos_separados a
+      JOIN separados s ON a.separado_id = s.id
+      LEFT JOIN clientes c ON s.cliente_id = c.id
+      LEFT JOIN cajeros ca ON a.cajero_id = ca.id
+      ${whereClause}
+      ORDER BY a.fecha_pago DESC
+    `;
+
+    const [abonos]: any = await pool.promise().query(queryAbonos, params);
+
+    // Consulta de métricas globales de separados de la empresa
+    const queryMetricas = `
+      SELECT 
+        COUNT(id) as total_separados_registrados,
+        COALESCE(SUM(total), 0) as valor_total_separados,
+        COALESCE(SUM(saldo_pendiente), 0) as saldo_total_pendiente,
+        COALESCE(SUM(total - saldo_pendiente), 0) as total_recaudado_historico,
+        COALESCE(SUM(CASE WHEN estado = 'Pendiente' THEN total ELSE 0 END), 0) as total_separados_activos,
+        COALESCE(SUM(CASE WHEN estado = 'Pendiente' THEN saldo_pendiente ELSE 0 END), 0) as saldo_pendiente_activos
+      FROM separados
+      WHERE empresa_id = ?
+    `;
+
+    const [metricasRes]: any = await pool.promise().query(queryMetricas, [empresa_id]);
+
+    res.json({
+      abonos,
+      resumen_global: metricasRes[0] || {}
+    });
+  } catch (error: any) {
+    console.error("Error al consultar historial de abonos:", error);
+    res.status(500).json({ error: "Error al consultar historial de abonos" });
+  }
+});
+
 // GET all separados
 router.get("/", (req: any, res: any) => {
   const empresa_id = req.user.empresa_id;
