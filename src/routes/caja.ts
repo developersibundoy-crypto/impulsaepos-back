@@ -4,6 +4,82 @@ import { verifyTokenAndTenant } from "../middlewares/authMiddleware";
 
 const router = express.Router();
 
+const centavos = (n: any) => Math.round(Number(n) * 100);
+
+function getQueryVentas(empresa_id: any, cajero_id: any, fecha_apertura: any) {
+  const sql = `
+    SELECT 
+      COALESCE(SUM(total_bruto), 0) as total_ventas,
+      COALESCE(SUM(efectivo), 0) as total_efectivo,
+      COALESCE(SUM(IF(metodo_pago LIKE '%Transferencia%' OR metodo_pago = 'Mixto', transferencia, 0)), 0) as total_transferencia,
+      COALESCE(SUM(IF(metodo_pago = 'Tarjeta', transferencia, 0)), 0) as total_tarjeta,
+      COALESCE(SUM(IF(metodo_pago = 'Addi', transferencia, 0)), 0) as total_addi,
+      COALESCE(SUM(IF(metodo_pago = 'Sistecredito', transferencia, 0)), 0) as total_sistecredito,
+      COALESCE(SUM(IF(tipo_origen = 'ABONO_SEPARADO' AND total_bruto > 0, total_bruto, 0)), 0) as total_abonos_separados,
+      COALESCE(SUM(IF(tipo_origen = 'ABONO_SEPARADO' AND total_bruto < 0, ABS(total_bruto), 0)), 0) as total_devoluciones_separados,
+      COALESCE(SUM(IF(tipo_origen = 'ABONO_SEPARADO' AND total_bruto > 0, efectivo, 0)), 0) as efectivo_abonos_separados,
+      COALESCE(SUM(IF(tipo_origen = 'ABONO_SEPARADO' AND total_bruto < 0, ABS(efectivo), 0)), 0) as efectivo_devoluciones_separados
+    FROM (
+      SELECT 
+        'VENTA' as tipo_origen,
+        total as total_bruto,
+        pago_efectivo as efectivo,
+        pago_transferencia as transferencia,
+        metodo_pago,
+        fecha,
+        cajero_id,
+        empresa_id
+      FROM facturas_venta
+
+      UNION ALL
+
+      SELECT 
+        'FACTURA_ELECTRONICA' as tipo_origen,
+        total as total_bruto,
+        pago_efectivo as efectivo,
+        pago_transferencia as transferencia,
+        metodo_pago,
+        fecha_emision as fecha,
+        cajero_id,
+        empresa_id
+      FROM facturas_electronicas
+
+      UNION ALL
+
+      SELECT 
+        'ABONO_SEPARADO' as tipo_origen,
+        monto as total_bruto,
+        pago_efectivo as efectivo,
+        pago_transferencia as transferencia,
+        metodo_pago,
+        fecha_pago as fecha,
+        cajero_id,
+        empresa_id
+      FROM abonos_separados
+
+      UNION ALL
+
+      SELECT 
+        'CAMBIO_FACTURA' as tipo_origen,
+        saldo_adicional as total_bruto,
+        IF(metodo_pago = 'Efectivo', saldo_adicional, 0) as efectivo,
+        IF(metodo_pago != 'Efectivo', saldo_adicional, 0) as transferencia,
+        metodo_pago,
+        fecha,
+        cajero_id,
+        empresa_id
+      FROM cambios_factura
+      WHERE saldo_adicional > 0
+    ) AS todas_ventas
+    WHERE empresa_id = ? 
+      ${cajero_id ? "AND (cajero_id = ? OR cajero_id IS NULL)" : ""}
+      AND fecha >= ?
+  `;
+
+  const params = cajero_id ? [empresa_id, cajero_id, fecha_apertura] : [empresa_id, fecha_apertura];
+  return { sql, params };
+}
+
 // Obtener estado actual de la caja para un usuario
 router.get("/estado-actual", verifyTokenAndTenant, (req: any, res: any) => {
   const usuario_id = req.user.id;
@@ -21,45 +97,13 @@ router.get("/estado-actual", verifyTokenAndTenant, (req: any, res: any) => {
       return res.status(500).json({ error: "Error al consultar caja" });
     }
 
-
     if (results.length === 0) {
       return res.json({ abierta: false });
     }
 
     const sesion = results[0];
-
-    // Calcular ventas desde la apertura
-    // Necesitamos el cajero_id asociado al usuario para filtrar facturas_venta
-    // El cajero_id viene en el token (req.user.cajero_id)
     const cajero_id = req.user.cajero_id;
-
-    const queryVentas = `
-        SELECT 
-          SUM(total_bruto) as total_ventas,
-          SUM(efectivo) as total_efectivo,
-          SUM(IF(metodo_pago = 'Transferencia' OR metodo_pago = 'Mixto', transferencia, 0)) as total_transferencia,
-          SUM(IF(metodo_pago = 'Tarjeta', transferencia, 0)) as total_tarjeta,
-          SUM(IF(metodo_pago = 'Addi', transferencia, 0)) as total_addi,
-          SUM(IF(metodo_pago = 'Sistecredito', transferencia, 0)) as total_sistecredito
-        FROM (
-          -- Ventas directas
-          SELECT total as total_bruto, pago_efectivo as efectivo, pago_transferencia as transferencia, metodo_pago, fecha, cajero_id, empresa_id FROM facturas_venta
-          UNION ALL
-          -- Ventas electrónicas
-          SELECT total as total_bruto, pago_efectivo as efectivo, pago_transferencia as transferencia, metodo_pago, fecha_emision as fecha, cajero_id, empresa_id FROM facturas_electronicas
-          UNION ALL
-          -- Abonos y pagos de separados (Layaway)
-          SELECT monto as total_bruto, pago_efectivo as efectivo, pago_transferencia as transferencia, metodo_pago, fecha_pago as fecha, cajero_id, empresa_id FROM abonos_separados
-          UNION ALL
-          -- Saldos a favor por cambios de producto
-          SELECT saldo_adicional as total_bruto, IF(metodo_pago='Efectivo', saldo_adicional, 0) as efectivo, IF(metodo_pago!='Efectivo', saldo_adicional, 0) as transferencia, metodo_pago, fecha, cajero_id, empresa_id FROM cambios_factura WHERE saldo_adicional > 0
-        ) AS todas_ventas
-        WHERE empresa_id = ? 
-        ${cajero_id ? "AND cajero_id = ?" : ""}
-        AND fecha >= ?
-      `;
-
-    const params = cajero_id ? [empresa_id, cajero_id, sesion.fecha_apertura] : [empresa_id, sesion.fecha_apertura];
+    const { sql: queryVentas, params } = getQueryVentas(empresa_id, cajero_id, sesion.fecha_apertura);
 
     connection.query(queryVentas, params, (errV: any, resultsV: any[]) => {
       if (errV) {
@@ -93,12 +137,16 @@ router.get("/estado-actual", verifyTokenAndTenant, (req: any, res: any) => {
           abierta: true,
           sesion: {
             ...sesion,
-            total_ventas: totals.total_ventas || 0,
+            total_ventas: parseFloat(totals.total_ventas || 0),
             total_efectivo: total_efectivo_ventas,
-            total_transferencia: totals.total_transferencia || 0,
-            total_tarjeta: totals.total_tarjeta || 0,
-            total_addi: totals.total_addi || 0,
-            total_sistecredito: totals.total_sistecredito || 0,
+            total_transferencia: parseFloat(totals.total_transferencia || 0),
+            total_tarjeta: parseFloat(totals.total_tarjeta || 0),
+            total_addi: parseFloat(totals.total_addi || 0),
+            total_sistecredito: parseFloat(totals.total_sistecredito || 0),
+            total_abonos_separados: parseFloat(totals.total_abonos_separados || 0),
+            total_devoluciones_separados: parseFloat(totals.total_devoluciones_separados || 0),
+            efectivo_abonos_separados: parseFloat(totals.efectivo_abonos_separados || 0),
+            efectivo_devoluciones_separados: parseFloat(totals.efectivo_devoluciones_separados || 0),
             total_ingresos: ingresos,
             total_salidas: salidas,
             // FÓRMULA MAESTRA: Base + Efectivo de Ventas y Abonos + Ajustes Positivos - Ajustes Negativos
@@ -117,7 +165,6 @@ router.post("/apertura", verifyTokenAndTenant, (req: any, res: any) => {
   const empresa_id = req.user.empresa_id;
 
   console.log(`[CAJA_APERTURA] Intento por Usuario: ${usuario_id}, Empresa: ${empresa_id}, Base: ${base_caja}`);
-
 
   if (base_caja === undefined || base_caja === null) {
     return res.status(400).json({ error: "El valor base es obligatorio" });
@@ -157,124 +204,81 @@ router.post("/apertura", verifyTokenAndTenant, (req: any, res: any) => {
 });
 
 // Cierre de caja
-router.post("/cierre", verifyTokenAndTenant, (req: any, res: any) => {
+router.post("/cierre", verifyTokenAndTenant, async (req: any, res: any) => {
   const { dinero_reportado } = req.body;
   const usuario_id = req.user.id;
   const empresa_id = req.user.empresa_id;
   const cajero_id = req.user.cajero_id;
 
-  if (dinero_reportado === undefined || dinero_reportado === null) {
+  if (dinero_reportado === undefined || dinero_reportado === null || !Number.isFinite(Number(dinero_reportado))) {
     return res.status(400).json({ error: "El dinero reportado es obligatorio" });
   }
 
-  // Obtener la sesión abierta
-  connection.query(
-    "SELECT * FROM sesiones_caja WHERE usuario_id = ? AND empresa_id = ? AND estado = 'Abierta' ORDER BY fecha_apertura DESC LIMIT 1",
-    [usuario_id, empresa_id],
-    (err: any, results: any[]) => {
-      if (err || results.length === 0) return res.status(404).json({ error: "No hay sesión abierta para cerrar" });
+  let conn: any;
+  try {
+    conn = await connection.promise().getConnection();
+    await conn.beginTransaction();
 
-      const sesion = results[0];
-
-      // Calcular ventas finales
-      const queryVentas = `
-        SELECT 
-          SUM(total_bruto) as total_ventas,
-          SUM(efectivo) as total_efectivo,
-          SUM(IF(metodo_pago = 'Transferencia' OR metodo_pago = 'Mixto', transferencia, 0)) as total_transferencia,
-          SUM(IF(metodo_pago = 'Tarjeta', transferencia, 0)) as total_tarjeta,
-          SUM(IF(metodo_pago = 'Addi', transferencia, 0)) as total_addi,
-          SUM(IF(metodo_pago = 'Sistecredito', transferencia, 0)) as total_sistecredito
-        FROM (
-          SELECT total as total_bruto, pago_efectivo as efectivo, pago_transferencia as transferencia, metodo_pago, fecha, cajero_id, empresa_id FROM facturas_venta
-          UNION ALL
-          SELECT total as total_bruto, pago_efectivo as efectivo, pago_transferencia as transferencia, metodo_pago, fecha_emision as fecha, cajero_id, empresa_id FROM facturas_electronicas
-          UNION ALL
-          SELECT monto as total_bruto, pago_efectivo as efectivo, pago_transferencia as transferencia, metodo_pago, fecha_pago as fecha, cajero_id, empresa_id FROM abonos_separados
-          UNION ALL
-          SELECT saldo_adicional as total_bruto, IF(metodo_pago='Efectivo', saldo_adicional, 0) as efectivo, IF(metodo_pago!='Efectivo', saldo_adicional, 0) as transferencia, metodo_pago, fecha, cajero_id, empresa_id FROM cambios_factura WHERE saldo_adicional > 0
-        ) AS todas_ventas
-        WHERE empresa_id = ? 
-        ${cajero_id ? "AND cajero_id = ?" : ""}
-        AND fecha >= ?
-      `;
-
-      const params = cajero_id ? [empresa_id, cajero_id, sesion.fecha_apertura] : [empresa_id, sesion.fecha_apertura];
-
-      connection.query(queryVentas, params, (errV: any, resultsV: any[]) => {
-        if (errV) return res.status(500).json({ error: "Error al calcular ventas finales" });
-
-        const totals = resultsV[0];
-        const total_ventas = totals.total_ventas || 0;
-        const total_efectivo = totals.total_efectivo || 0;
-        const total_transferencia = totals.total_transferencia || 0;
-        const total_tarjeta = totals.total_tarjeta || 0;
-        const total_addi = totals.total_addi || 0;
-        const total_sistecredito = totals.total_sistecredito || 0;
-
-        // Consultar movimientos manuales antes de cerrar
-        const queryMovs = `
-          SELECT 
-            SUM(IF(tipo = 'Ingreso', ABS(monto), 0)) as total_ingresos,
-            SUM(IF(tipo = 'Salida', ABS(monto), 0)) as total_salidas
-          FROM movimientos_caja
-          WHERE sesion_caja_id = ? AND empresa_id = ?
-        `;
-
-        connection.query(queryMovs, [sesion.id, empresa_id], (errM: any, resultsM: any[]) => {
-          if (errM) return res.status(500).json({ error: "Error al calcular movimientos finales" });
-
-          const movs = resultsM[0];
-          const ingresos = parseFloat(movs.total_ingresos || 0);
-          const salidas = parseFloat(movs.total_salidas || 0);
-
-          const valor_esperado = parseFloat(sesion.base_caja) + parseFloat(total_efectivo) + ingresos - salidas;
-          const diferencia = parseFloat(dinero_reportado) - valor_esperado;
-
-          const queryUpdate = `
-            UPDATE sesiones_caja SET
-              fecha_cierre = CURRENT_TIMESTAMP,
-              total_ventas = ?,
-              total_efectivo = ?,
-              total_transferencia = ?,
-              total_tarjeta = ?,
-              total_addi = ?,
-              total_sistecredito = ?,
-              total_ingresos = ?,
-              total_salidas = ?,
-              dinero_reportado = ?,
-              diferencia = ?,
-              estado = 'Cerrada'
-            WHERE id = ?
-          `;
-
-          connection.query(queryUpdate, [total_ventas, total_efectivo, total_transferencia, total_tarjeta, total_addi, total_sistecredito, ingresos, salidas, dinero_reportado, diferencia, sesion.id], (errU: any) => {
-            if (errU) return res.status(500).json({ error: "Error al cerrar caja" });
-            // Notificar por Socket
-            if (req.io) {
-              req.io.to(`empresa_${empresa_id}`).emit('caja_cerrada', { usuario_id, resumen: { total_ventas, dinero_reportado, diferencia } });
-            }
-            res.json({
-              success: true,
-              resumen: {
-                total_ventas,
-                total_efectivo,
-                total_transferencia,
-                total_tarjeta,
-                total_addi,
-                total_sistecredito,
-                total_ingresos: ingresos,
-                total_salidas: salidas,
-                valor_esperado,
-                diferencia,
-                dinero_reportado
-              }
-            });
-          });
-        });
-      });
+    const [results]: any = await conn.query(
+      "SELECT * FROM sesiones_caja WHERE usuario_id = ? AND empresa_id = ? AND estado = 'Abierta' ORDER BY fecha_apertura DESC LIMIT 1 FOR UPDATE",
+      [usuario_id, empresa_id]
+    );
+    if (!results.length) {
+      await conn.rollback();
+      return res.status(404).json({ error: 'No hay sesión abierta para cerrar' });
     }
-  );
+    const sesion = results[0];
+    const { sql, params } = getQueryVentas(empresa_id, cajero_id, sesion.fecha_apertura);
+    const [ventas]: any = await conn.query(sql, params);
+    const totals = ventas[0];
+
+    const [movimientos]: any = await conn.query(`SELECT
+      SUM(IF(tipo = 'Ingreso', ABS(monto), 0)) AS total_ingresos,
+      SUM(IF(tipo = 'Salida', ABS(monto), 0)) AS total_salidas
+      FROM movimientos_caja WHERE sesion_caja_id = ? AND empresa_id = ?`, [sesion.id, empresa_id]);
+
+    const total_ventas = Number(totals.total_ventas || 0);
+    const total_efectivo = Number(totals.total_efectivo || 0);
+    const total_transferencia = Number(totals.total_transferencia || 0);
+    const total_tarjeta = Number(totals.total_tarjeta || 0);
+    const total_addi = Number(totals.total_addi || 0);
+    const total_sistecredito = Number(totals.total_sistecredito || 0);
+    const total_abonos_separados = Number(totals.total_abonos_separados || 0);
+    const total_devoluciones_separados = Number(totals.total_devoluciones_separados || 0);
+    const efectivo_abonos_separados = Number(totals.efectivo_abonos_separados || 0);
+    const efectivo_devoluciones_separados = Number(totals.efectivo_devoluciones_separados || 0);
+
+    const ingresos = Number(movimientos[0].total_ingresos || 0);
+    const salidas = Number(movimientos[0].total_salidas || 0);
+    const valor_esperado = Number(sesion.base_caja) + total_efectivo + ingresos - salidas;
+    const diferencia = Number(dinero_reportado) - valor_esperado;
+
+    await conn.query(`UPDATE sesiones_caja SET fecha_cierre = CURRENT_TIMESTAMP,
+      total_ventas = ?, total_efectivo = ?, total_transferencia = ?, total_tarjeta = ?,
+      total_addi = ?, total_sistecredito = ?, total_ingresos = ?, total_salidas = ?,
+      dinero_reportado = ?, diferencia = ?, estado = 'Cerrada' WHERE id = ? AND empresa_id = ?`,
+      [total_ventas, total_efectivo, total_transferencia, total_tarjeta, total_addi, total_sistecredito,
+        ingresos, salidas, dinero_reportado, diferencia, sesion.id, empresa_id]);
+
+    await conn.commit();
+
+    if (req.io) req.io.to(`empresa_${empresa_id}`).emit('caja_cerrada', { usuario_id, resumen: { total_ventas, dinero_reportado, diferencia } });
+
+    res.json({ success: true, resumen: {
+      total_ventas, total_efectivo, total_transferencia, total_tarjeta, total_addi, total_sistecredito,
+      total_abonos_separados,
+      total_devoluciones_separados,
+      efectivo_abonos_separados,
+      efectivo_devoluciones_separados,
+      total_ingresos: ingresos, total_salidas: salidas, valor_esperado, diferencia, dinero_reportado
+    } });
+  } catch (error: any) {
+    if (conn) await conn.rollback();
+    console.error('Error al cerrar caja:', error);
+    res.status(500).json({ error: 'Error al cerrar caja' });
+  } finally {
+    if (conn) conn.release();
+  }
 });
 
 // Historial de reportes
@@ -316,7 +320,7 @@ router.get("/reportes", verifyTokenAndTenant, (req: any, res: any) => {
 });
 
 // Registro de movimiento manual (Ingreso / Salida)
-router.post("/movimiento", verifyTokenAndTenant, (req: any, res: any) => {
+router.post("/movimiento", verifyTokenAndTenant, async (req: any, res: any) => {
   const { monto, descripcion, tipo, sesion_caja_id } = req.body;
   const usuario_id = req.user.id;
   const empresa_id = req.user.empresa_id;
@@ -325,7 +329,11 @@ router.post("/movimiento", verifyTokenAndTenant, (req: any, res: any) => {
     return res.status(400).json({ error: "Faltan campos obligatorios" });
   }
 
-  if (monto <= 0) {
+  if (/^(ABONO_SEPARADO|DEVOLUCION_SEPARADO)\s*:/i.test(String(descripcion).trim())) {
+    return res.status(400).json({ error: 'Referencia reservada para auditoría de separados' });
+  }
+
+  if (!Number.isFinite(Number(monto)) || monto <= 0 || !['Ingreso', 'Salida'].includes(tipo)) {
     return res.status(400).json({ error: "El monto debe ser mayor a cero" });
   }
 
@@ -334,17 +342,24 @@ router.post("/movimiento", verifyTokenAndTenant, (req: any, res: any) => {
     VALUES (?, ?, ?, ?, ?, ?)
   `;
 
-  connection.query(query, [empresa_id, usuario_id, sesion_caja_id, tipo, monto, descripcion], (err: any) => {
-    if (err) {
-      console.error("Error al registrar movimiento:", err);
-      return res.status(500).json({ error: "Error al registrar movimiento" });
-    }
+  let conn: any;
+  try {
+    centavos(monto);
+    conn = await connection.promise().getConnection();
+    await conn.beginTransaction();
+    const [sesiones]: any = await conn.query("SELECT id FROM sesiones_caja WHERE id = ? AND empresa_id = ? AND usuario_id = ? AND estado = 'Abierta' FOR UPDATE", [sesion_caja_id, empresa_id, usuario_id]);
+    if (!sesiones.length) throw new Error('La sesión no está abierta o no pertenece al usuario');
+    await conn.query(query, [empresa_id, usuario_id, sesion_caja_id, tipo, monto, descripcion]);
+    await conn.commit();
     // Notificar por Socket
     if (req.io) {
       req.io.to(`empresa_${empresa_id}`).emit('caja_movimiento', { tipo, monto, descripcion });
     }
     res.json({ success: true, message: "Movimiento registrado con éxito" });
-  });
+  } catch (err: any) {
+    if (conn) await conn.rollback();
+    res.status(400).json({ error: err.message });
+  } finally { if (conn) conn.release(); }
 });
 
 // Obtener detalles de movimientos de una sesión

@@ -1,6 +1,7 @@
 import express from "express";
 import pool from "../conection";
 import { verifyTokenAndTenant } from "../middlewares/authMiddleware";
+import { centavos, distribuirAbono, distribuirDevolucion, registrarAbono, rastreoSeparados, normalizarHistorico, obtenerTurnoAbono, resumenFlujo } from "../services/separadosCaja";
 
 const router = express.Router();
 
@@ -22,6 +23,12 @@ router.get("/historial-abonos", async (req: any, res: any) => {
     } else if (fecha_inicio && fecha_fin) {
       whereClause += " AND DATE(a.fecha_pago) BETWEEN ? AND ?";
       params.push(fecha_inicio, fecha_fin);
+    } else if (fecha_inicio) {
+      whereClause += " AND DATE(a.fecha_pago) >= ?";
+      params.push(fecha_inicio);
+    } else if (fecha_fin) {
+      whereClause += " AND DATE(a.fecha_pago) <= ?";
+      params.push(fecha_fin);
     }
 
     if (cliente_id) {
@@ -41,8 +48,7 @@ router.get("/historial-abonos", async (req: any, res: any) => {
         a.separado_id,
         a.monto,
         a.metodo_pago,
-        a.pago_efectivo,
-        a.pago_transferencia,
+        a.pago_efectivo, a.pago_transferencia,
         a.fecha_pago,
         s.cliente_id,
         c.nombre as cliente_nombre,
@@ -50,16 +56,18 @@ router.get("/historial-abonos", async (req: any, res: any) => {
         c.telefono as cliente_telefono,
         ca.nombre as cajero_nombre,
         s.total as separado_total,
-        s.saldo_pendiente,
+        (CASE WHEN s.estado = 'Anulado' THEN 0 ELSE s.saldo_pendiente END) as saldo_pendiente,
         s.estado as separado_estado,
+        (SELECT COALESCE(SUM(monto),0) FROM abonos_separados x WHERE x.separado_id = s.id AND x.empresa_id = s.empresa_id) AS neto_abonado,
+        (SELECT COALESCE(SUM(-monto),0) FROM abonos_separados x WHERE x.separado_id = s.id AND x.empresa_id = s.empresa_id AND x.monto < 0) AS total_devuelto,
         s.fecha_creacion as separado_fecha_creacion,
         s.fecha_vencimiento as separado_fecha_vencimiento
       FROM abonos_separados a
-      JOIN separados s ON a.separado_id = s.id
+      JOIN separados s ON a.separado_id = s.id AND a.empresa_id = s.empresa_id
       LEFT JOIN clientes c ON s.cliente_id = c.id
       LEFT JOIN cajeros ca ON a.cajero_id = ca.id
       ${whereClause}
-      ORDER BY a.fecha_pago DESC
+      ORDER BY a.fecha_pago DESC, a.id DESC
     `;
 
     const [abonos]: any = await pool.promise().query(queryAbonos, params);
@@ -69,18 +77,23 @@ router.get("/historial-abonos", async (req: any, res: any) => {
       SELECT 
         COUNT(id) as total_separados_registrados,
         COALESCE(SUM(total), 0) as valor_total_separados,
-        COALESCE(SUM(saldo_pendiente), 0) as saldo_total_pendiente,
-        COALESCE(SUM(total - saldo_pendiente), 0) as total_recaudado_historico,
-        COALESCE(SUM(CASE WHEN estado = 'Pendiente' THEN total ELSE 0 END), 0) as total_separados_activos,
+        COALESCE(SUM(CASE WHEN estado = 'Pendiente' THEN saldo_pendiente ELSE 0 END), 0) as saldo_total_pendiente,
+        (SELECT COALESCE(SUM(monto),0) FROM abonos_separados WHERE empresa_id = ?) as total_recaudado_historico,
+        COUNT(CASE WHEN estado = 'Pendiente' THEN 1 END) as total_separados_activos,
         COALESCE(SUM(CASE WHEN estado = 'Pendiente' THEN saldo_pendiente ELSE 0 END), 0) as saldo_pendiente_activos
       FROM separados
       WHERE empresa_id = ?
     `;
 
-    const [metricasRes]: any = await pool.promise().query(queryMetricas, [empresa_id]);
+    const [metricasRes]: any = await pool.promise().query(queryMetricas, [empresa_id, empresa_id]);
+    const rastreo = await rastreoSeparados(pool.promise(), empresa_id);
+    const porId = new Map(rastreo.map((a: any) => [a.id, a]));
 
+    const historial = abonos.map((a: any) => ({ ...a, ...(porId.get(a.id) as any),
+      pendiente_devolucion: a.separado_estado === 'Anulado' ? Math.max(0, Number(a.neto_abonado)) : 0 }));
     res.json({
-      abonos,
+      abonos: historial,
+      resumen_flujo_filtrado: resumenFlujo(historial),
       resumen_global: metricasRes[0] || {}
     });
   } catch (error: any) {
@@ -145,9 +158,14 @@ router.get("/:id", (req: any, res: any) => {
       ORDER BY a.fecha_pago ASC
     `;
     pool.query(abonosSql, [id, empresa_id], (err2: any, abonosRes: any) => {
+      if (err2) return res.status(500).json({ error: 'Error obteniendo abonos' });
+      const normalizados = (abonosRes || []).map(normalizarHistorico);
+      const flujo = resumenFlujo(normalizados);
       res.json({
-        separado: sepRes[0],
-        abonos: abonosRes || []
+        separado: { ...sepRes[0], neto_abonado: flujo.neto_nominal, total_devuelto: flujo.devuelto_nominal,
+          pendiente_devolucion: sepRes[0].estado === 'Anulado' ? Math.max(0, flujo.neto_nominal) : 0 },
+        abonos: normalizados,
+        resumen_flujo: flujo
       });
     });
   });
@@ -168,7 +186,13 @@ router.post("/", async (req: any, res: any) => {
   try {
     await conn.beginTransaction();
 
-    const saldo_pendiente = parseFloat(total) - (parseFloat(abono_inicial) || 0);
+    centavos(total);
+    centavos(abono_inicial || 0);
+    if (!Number.isFinite(Number(total)) || Number(total) <= 0 ||
+        !Number.isFinite(Number(abono_inicial || 0)) || Number(abono_inicial || 0) < 0 || Number(abono_inicial || 0) > Number(total)) {
+      throw new Error('Total o abono inicial inválido');
+    }
+    const saldo_pendiente = (centavos(total) - centavos(abono_inicial || 0)) / 100;
 
     // 1. Crear el registro del Separado (Privado por empresa_id)
     const [sepResult]: any = await conn.query(
@@ -176,7 +200,7 @@ router.post("/", async (req: any, res: any) => {
       [
         empresa_id, 
         cliente_id, 
-        req.body.cajero_id || null, 
+        req.user.cajero_id || req.body.cajero_id || null,
         total, 
         saldo_pendiente, 
         JSON.stringify(detalles)
@@ -219,16 +243,7 @@ router.post("/", async (req: any, res: any) => {
 
     // 3. Registrar Abono Inicial si fue entregado
     if (abono_inicial && parseFloat(abono_inicial) > 0) {
-      const initMetodo = req.body.metodo_pago || 'Efectivo';
-      const initEfec = req.body.pago_efectivo || (initMetodo === 'Efectivo' ? abono_inicial : 0);
-      const initTrans = req.body.pago_transferencia || (initMetodo === 'Transferencia' ? abono_inicial : 0);
-
-      const initCajero = req.body.cajero_id || null;
-
-      await conn.query(
-        "INSERT INTO abonos_separados (empresa_id, separado_id, cajero_id, monto, metodo_pago, pago_efectivo, pago_transferencia) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        [empresa_id, separadoId, initCajero, abono_inicial, initMetodo, initEfec, initTrans]
-      );
+      await registrarAbono(conn, req, separadoId, Number(abono_inicial), distribuirAbono(abono_inicial, req.body));
     }
 
     await conn.commit();
@@ -273,19 +288,10 @@ router.post("/:id/abonos", async (req: any, res: any) => {
     
     const { saldo_pendiente, estado } = results[0];
     if (estado !== "Pendiente") throw new Error(`El separado no admite abonos porque está ${estado}`);
-    if (monto > saldo_pendiente) throw new Error(`El abono (${monto}) supera el saldo pendiente (${saldo_pendiente})`);
+    if (Number(monto) > Number(saldo_pendiente)) throw new Error(`El abono (${monto}) supera el saldo pendiente (${saldo_pendiente})`);
     
     // 1. Insertar Registro de Abono Detallado
-    const met = req.body.metodo_pago || 'Efectivo';
-    const efec = req.body.pago_efectivo || (met === 'Efectivo' ? monto : 0);
-    const trans = req.body.pago_transferencia || (met === 'Transferencia' ? monto : 0);
-
-    const cajId = req.body.cajero_id || null;
-
-    await conn.query(
-      "INSERT INTO abonos_separados (empresa_id, separado_id, cajero_id, monto, metodo_pago, pago_efectivo, pago_transferencia) VALUES (?, ?, ?, ?, ?, ?, ?)", 
-      [empresa_id, id, cajId, monto, met, efec, trans]
-    );
+    await registrarAbono(conn, req, id, Number(monto), distribuirAbono(monto, req.body));
     
     // 2. Actualizar Saldo atómicamente
     await conn.query("UPDATE separados SET saldo_pendiente = saldo_pendiente - ? WHERE id = ? AND empresa_id = ?", [monto, id, empresa_id]);
@@ -297,7 +303,7 @@ router.post("/:id/abonos", async (req: any, res: any) => {
        req.io.to(`empresa_${empresa_id}`).emit('abono_added', { separado_id: id, monto });
     }
 
-    res.json({ success: true, message: "Abono registrado correctamente", nuevo_saldo: saldo_pendiente - monto });
+    res.json({ success: true, message: "Abono registrado correctamente", nuevo_saldo: (centavos(saldo_pendiente) - centavos(monto)) / 100 });
 
   } catch (error: any) {
     await conn.rollback();
@@ -383,7 +389,7 @@ router.put("/:id", async (req: any, res: any) => {
     // 3. Recalcular saldo pendiente basado en el nuevo total y abonos previos
     const [abonosRes]: any = await conn.query("SELECT SUM(monto) as total_abonos FROM abonos_separados WHERE separado_id = ? AND empresa_id = ?", [id, empresa_id]);
     const totalAbonos = parseFloat(abonosRes[0].total_abonos) || 0;
-    const newSaldo = parseFloat(total) - totalAbonos;
+    const newSaldo = (centavos(total) - centavos(totalAbonos)) / 100;
 
     if (newSaldo < 0) throw new Error("El nuevo total no puede ser inferior a los abonos ya realizados.");
 
@@ -414,7 +420,7 @@ router.put("/:id", async (req: any, res: any) => {
 router.put("/:id/completar", async (req: any, res: any) => {
   const empresa_id = req.user.empresa_id;
   const { id } = req.params;
-  const { cajero_id, metodo_pago, pago_efectivo, pago_transferencia } = req.body; 
+  const { cajero_id } = req.body;
 
   const promisePool = pool.promise();
   const conn = await promisePool.getConnection();
@@ -435,14 +441,14 @@ router.put("/:id/completar", async (req: any, res: any) => {
     // 2. Crear Factura Final de Venta
     const [fRes]: any = await conn.query(
       "INSERT INTO facturas_venta (empresa_id, cajero_id, cliente_id, total, metodo_pago, pago_efectivo, pago_transferencia) VALUES (?, ?, ?, ?, ?, ?, ?)", 
-      [empresa_id, cajero_id || null, separado.cliente_id, separado.total, metodo_pago || "Efectivo", pago_efectivo || 0, pago_transferencia || 0]
+      [empresa_id, req.user.cajero_id || cajero_id || null, separado.cliente_id, separado.total, 'Separado', 0, 0]
     );
     const facturaId = fRes.insertId;
 
     // 3. Registrar detalles (Sin descontar stock de nuevo, ya se descontó al reservar)
     for (const item of items) {
       const qty = item.qty || item.cantidad;
-      const [pData]: any = await conn.query("SELECT precio_compra FROM productos WHERE id = ?", [item.id]);
+      const [pData]: any = await conn.query("SELECT precio_compra FROM productos WHERE id = ? AND empresa_id = ?", [item.id, empresa_id]);
       const costo = pData[0]?.precio_compra || 0;
 
       await conn.query(
@@ -453,7 +459,7 @@ router.put("/:id/completar", async (req: any, res: any) => {
       // Solo registro en Kardex que la reserva se convirtió en factura
       await conn.query(
         "INSERT INTO kardex (producto_id, empresa_id, tipo_movimiento, cantidad_antes, cantidad_modificada, cantidad_despues, motivo, referencia) VALUES (?, ?, 'SALIDA', 0, 0, 0, ?, ?)",
-        [item.id, empresa_id, 'Conversión Separado a Venta', `FS-${facturaId}`]
+        [item.id, empresa_id, `Conversión Separado SEP-${id} a Venta`, `FS-${facturaId}`]
       );
     }
 
@@ -478,11 +484,13 @@ router.put("/:id/completar", async (req: any, res: any) => {
   }
 });
 
-// PUT anular separado (Liberar Reserva de Stock)
-router.put("/:id/anular", async (req: any, res: any) => {
+// Función central para anular separado, devolver dinero (impactando cierre de caja) y registrar en Kardex con auditor
+async function anularSeparadoConDevolucion(req: any, res: any) {
   const empresa_id = req.user.empresa_id;
   const { id } = req.params;
-  const { motivo } = req.body || {};
+  const { motivo, usuario_nombre } = req.body || {};
+  const auditor_nombre = usuario_nombre || req.user.username || 'Usuario';
+  const motivo_anulacion = motivo || 'Anulación de separado y devolución de dinero';
 
   const promisePool = pool.promise();
   const conn = await promisePool.getConnection();
@@ -494,45 +502,103 @@ router.put("/:id/anular", async (req: any, res: any) => {
     if (sepResults.length === 0) throw new Error("Separado no encontrado");
     const separado = sepResults[0];
 
-    if (separado.estado !== "Pendiente") throw new Error("No se puede anular un separado que ya no está pendiente");
+    // 1. Calcular dinero abonado por el cliente hasta la fecha
+    const clave = String(req.body.operacion_id || '');
+    const turnoSolicitado = Number(req.body.sesion_caja_id);
+    if (!Number.isSafeInteger(turnoSolicitado) || !new RegExp(`^${Number(id)}\\.${turnoSolicitado}\\.[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$`).test(clave)) {
+      throw new Error('Identificador de devolución y turno obligatorios');
+    }
+    const prefijo = `DEVOLUCION_SEPARADO:${clave}:`;
+    const [previas]: any = await conn.query(`SELECT m.descripcion, m.usuario_id FROM movimientos_caja m
+      JOIN sesiones_caja sc ON sc.id = m.sesion_caja_id AND sc.empresa_id = m.empresa_id AND sc.usuario_id = m.usuario_id
+      WHERE m.empresa_id = ? AND m.sesion_caja_id = ? AND m.monto = 0 AND m.tipo = 'Ingreso'
+      AND BINARY LEFT(m.descripcion, ?) = BINARY ?`, [empresa_id, turnoSolicitado, prefijo.length, prefijo]);
+    if (previas.length) {
+      if (previas.length !== 1 || Number(previas[0].usuario_id) !== Number(req.user.id)) throw new Error('Operación no pertenece al usuario');
+      const anterior = JSON.parse(previas[0].descripcion.slice(prefijo.length));
+      if (anterior.ef !== centavos(req.body.devolucion_efectivo || 0) || anterior.tr !== centavos(req.body.devolucion_transferencia || 0)) throw new Error('La clave ya fue usada con otros importes');
+      await conn.commit();
+      return res.json({ ...anterior.respuesta, reintento: true });
+    }
+    const turno = await obtenerTurnoAbono(conn, req);
+    if (Number(turno.id) !== turnoSolicitado) throw new Error('El turno solicitado no es el turno abierto del usuario');
+    const [abonosRes]: any = await conn.query(
+      `SELECT COALESCE(SUM(monto), 0) as total_abonado
+        FROM abonos_separados WHERE separado_id = ? AND empresa_id = ?`,
+      [id, empresa_id]
+    );
 
-    const items = typeof separado.detalles_json === 'string' ? JSON.parse(separado.detalles_json) : separado.detalles_json;
+    const totalAbonado = parseFloat(abonosRes[0]?.total_abonado) || 0;
+    if (req.body.devolucion_efectivo === undefined && req.body.devolucion_transferencia === undefined) throw new Error('Indique monto y medio real de devolución');
+    if (totalAbonado < 0 || (totalAbonado === 0 && (centavos(req.body.devolucion_efectivo || 0) !== 0 || centavos(req.body.devolucion_transferencia || 0) !== 0))) throw new Error('No hay remanente nominal para esa devolución');
 
-    // Liberar Stock de cada ítem
-    for (const item of items) {
-      const qty = item.qty || item.cantidad;
-      const [pData]: any = await conn.query("SELECT cantidad, es_servicio FROM productos WHERE id = ? FOR UPDATE", [item.id]);
-      
-      if (pData.length > 0 && !pData[0].es_servicio) {
-         const stock_antes = pData[0].cantidad;
-         await conn.query("UPDATE productos SET cantidad = cantidad + ? WHERE id = ? AND empresa_id = ?", [qty, item.id, empresa_id]);
-         
-         // Registrar Liberación en Kardex
-         await conn.query(
-           "INSERT INTO kardex (producto_id, empresa_id, tipo_movimiento, cantidad_antes, cantidad_modificada, cantidad_despues, motivo, referencia) VALUES (?, ?, 'ENTRADA', ?, ?, ?, ?, ?)",
-           [item.id, empresa_id, stock_antes, qty, stock_antes + qty, `Anulación Separado: ${motivo || 'Sin detalle'}`, `SEP-${id}-ANUL`]
-         );
+    if (separado.estado !== "Pendiente" && !(separado.estado === "Anulado" && totalAbonado > 0)) {
+      throw new Error(`No se puede anular un separado que está ${separado.estado} y no tiene abonos pendientes por devolver.`);
+    }
+
+    let dineroDevuelto = 0;
+    // 2. Registrar únicamente el dinero realmente devuelto; permite saldar devoluciones parciales.
+    if (totalAbonado > 0) {
+      const dev = distribuirDevolucion(totalAbonado, 0, 0, req.body || {});
+      dineroDevuelto = dev.monto;
+      await registrarAbono(conn, req, id, -dev.monto, {
+        metodo: dev.metodo, efectivo: -dev.efectivo, transferencia: -dev.transferencia
+      });
+    }
+
+    // 3. Liberar Stock de cada ítem solo si estaba Pendiente (para evitar duplicar si ya fue anulado)
+    if (separado.estado === "Pendiente") {
+      const items = typeof separado.detalles_json === 'string' ? JSON.parse(separado.detalles_json) : separado.detalles_json;
+      if (Array.isArray(items)) {
+        for (const item of items) {
+          const qty = item.qty || item.cantidad;
+          const [pData]: any = await conn.query("SELECT cantidad, es_servicio FROM productos WHERE id = ? AND empresa_id = ? FOR UPDATE", [item.id, empresa_id]);
+
+          if (pData.length > 0 && !pData[0].es_servicio) {
+             const stock_antes = pData[0].cantidad;
+             await conn.query("UPDATE productos SET cantidad = cantidad + ? WHERE id = ? AND empresa_id = ?", [qty, item.id, empresa_id]);
+
+             // Registrar Liberación en Kardex incluyendo usuario_nombre (quién eliminó)
+             await conn.query(
+               "INSERT INTO kardex (producto_id, empresa_id, tipo_movimiento, cantidad_antes, cantidad_modificada, cantidad_despues, motivo, usuario_nombre, referencia) VALUES (?, ?, 'ENTRADA', ?, ?, ?, ?, ?, ?)",
+               [item.id, empresa_id, stock_antes, qty, stock_antes + qty, `Anulación Separado: ${motivo_anulacion}`, auditor_nombre, `SEP-${id}-ANUL`]
+             );
+          }
+        }
       }
     }
 
-    await conn.query("UPDATE separados SET estado = 'Anulado' WHERE id = ? AND empresa_id = ?", [id, empresa_id]);
+    // 4. Marcar separado como Anulado y saldo_pendiente = 0
+    await conn.query("UPDATE separados SET estado = 'Anulado', saldo_pendiente = 0 WHERE id = ? AND empresa_id = ?", [id, empresa_id]);
 
+    const respuesta = { success: true,
+      message: `Separado anulado. Devolución registrada: $${dineroDevuelto}. Pendiente por devolver: $${(centavos(totalAbonado) - centavos(dineroDevuelto)) / 100}.`,
+      dinero_devuelto: dineroDevuelto, pendiente_devolucion: (centavos(totalAbonado) - centavos(dineroDevuelto)) / 100 };
+    await conn.query("INSERT INTO movimientos_caja (empresa_id, usuario_id, sesion_caja_id, tipo, monto, descripcion) VALUES (?, ?, ?, 'Ingreso', 0, ?)",
+      [empresa_id, req.user.id, turno.id, prefijo + JSON.stringify({ ef: centavos(req.body.devolucion_efectivo || 0), tr: centavos(req.body.devolucion_transferencia || 0), respuesta })]);
     await conn.commit();
 
     // Notificar por Socket
     if (req.io) {
-       req.io.to(`empresa_${empresa_id}`).emit('separado_updated', { id, estado: 'Anulado' });
+       try { req.io.to(`empresa_${empresa_id}`).emit('separado_updated', { id, estado: 'Anulado' }); }
+       catch (error) { console.error('Devolución confirmada; notificación pendiente', error); }
     }
 
-    res.json({ success: true, message: "Separado anulado y stock liberado correctamente" });
+    res.json(respuesta);
 
   } catch (error: any) {
     await conn.rollback();
-    res.status(500).json({ error: error.message });
+    res.status(400).json({ error: error.message });
   } finally {
     conn.release();
   }
-});
+}
+
+// PUT anular separado (Liberar Reserva de Stock y devolver dinero)
+router.put("/:id/anular", anularSeparadoConDevolucion);
+
+// DELETE separado (Alias para anulación con devolución y trazabilidad)
+router.delete("/:id", anularSeparadoConDevolucion);
 
 export default router;
 

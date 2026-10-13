@@ -2,6 +2,7 @@ import express from "express";
 import pool from "../conection";
 import { verifyTokenAndTenant, verifyPermission } from "../middlewares/authMiddleware";
 import puntosService from "../services/puntosService";
+import { centavos } from "../services/separadosCaja";
 
 const router = express.Router();
 
@@ -65,13 +66,39 @@ router.post("/", verifyPermission("venta"), async (req: any, res: any) => {
       }
     }
     
-    // Cálculo de ingreso neto real en efectivo (restando el vuelto)
+    // Cálculo de ingreso neto real según método de pago
     const vlt = parseFloat(vuelto) || 0;
     const pefRaw = parseFloat(efectivoEntregado) || 0;
-    const pef = Math.max(0, pefRaw - vlt); 
-    const ptr = parseFloat(transferenciaEntregada) || 0;
+    const ptrRaw = parseFloat(transferenciaEntregada) || 0;
     const ivaVal = Math.round((parseFloat(iva) || 0) * 100) / 100;
     const totalVal = Math.round((parseFloat(total) || 0) * 100) / 100;
+
+    let pef = 0;
+    let ptr = 0;
+
+    if (metodoPago === 'Efectivo') {
+      pef = pefRaw > 0 ? Math.min(totalVal, Math.max(0, pefRaw - vlt)) : totalVal;
+      ptr = 0;
+    } else if (metodoPago === 'Transferencia' || metodoPago === 'Tarjeta' || metodoPago === 'Addi' || metodoPago === 'Sistecredito') {
+      ptr = ptrRaw > 0 ? ptrRaw : totalVal;
+      pef = 0;
+    } else if (metodoPago === 'Credito') {
+      pef = Math.max(0, pefRaw - vlt);
+      ptr = ptrRaw;
+    } else if (metodoPago === 'Mixto') {
+      pef = Math.max(0, pefRaw - vlt);
+      ptr = ptrRaw;
+      if (pef === 0 && ptr === 0) {
+        pef = totalVal;
+      }
+    } else {
+      if (pefRaw > 0 || ptrRaw > 0) {
+        pef = Math.max(0, pefRaw - vlt);
+        ptr = ptrRaw;
+      } else {
+        pef = totalVal;
+      }
+    }
 
     // 1. Insertar Cabecera de Factura
     const [resCab]: any = await conn.query(
@@ -84,7 +111,8 @@ router.post("/", verifyPermission("venta"), async (req: any, res: any) => {
     const totalPagado = pef + ptr;
     const saldoPendiente = Math.round((totalVal - totalPagado) * 100) / 100;
     
-    if ((metodoPago === 'Credito' || saldoPendiente > 0) && clId) {
+    // Solo registrar CxC si es venta a crédito explícita o si es Mixto con saldo restante pendiente
+    if ((metodoPago === 'Credito' || (metodoPago === 'Mixto' && saldoPendiente > 0.01)) && clId) {
       const saldoFinal = saldoPendiente > 0 ? saldoPendiente : totalVal;
       await conn.query(
         "INSERT INTO cuentas_por_cobrar (empresa_id, factura_venta_id, cliente_id, monto_total, saldo_pendiente, estado) VALUES (?, ?, ?, ?, ?, ?)",
@@ -342,6 +370,8 @@ router.get("/", verifyPermission("facturas_venta"), (req: any, res: any) => {
     whereClause += " AND f.metodo_pago = 'Addi'";
   } else if (filtro === "Sistecredito") {
     whereClause += " AND f.metodo_pago = 'Sistecredito'";
+  } else if (filtro === "Separado") {
+    whereClause += " AND f.tipo_factura = 'POS' AND (f.metodo_pago = 'Separado' OR EXISTS (SELECT 1 FROM kardex k WHERE k.empresa_id = f.empresa_id AND k.referencia = CONCAT('FS-', f.id) AND k.motivo = 'Conversión Separado a Venta'))";
   }
 
   const countQuery = `
@@ -351,7 +381,9 @@ router.get("/", verifyPermission("facturas_venta"), (req: any, res: any) => {
   `;
 
   const dataQuery = `
-    SELECT f.*
+    SELECT f.*, (f.tipo_factura = 'POS' AND (f.metodo_pago = 'Separado' OR EXISTS
+      (SELECT 1 FROM kardex k WHERE k.empresa_id = f.empresa_id AND k.referencia = CONCAT('FS-', f.id)
+      AND k.motivo = 'Conversión Separado a Venta'))) AS origen_separado
     FROM ${fromClause}
     ${whereClause}
     ORDER BY f.fecha DESC
@@ -410,7 +442,7 @@ router.delete("/:id", verifyPermission("facturas_venta"), async (req: any, res: 
   const facturaId = req.params.id;
   const tipo = req.query.tipo as string;
   const { motivo_anulacion, usuario_nombre } = req.body || {};
-  const auditor_nombre = usuario_nombre || req.user.username || 'System';
+  const auditor_nombre = usuario_nombre || req.user.nombre || req.user.username || 'Admin';
 
   const promisePool = pool.promise();
   const conn = await promisePool.getConnection();
@@ -456,6 +488,13 @@ router.delete("/:id", verifyPermission("facturas_venta"), async (req: any, res: 
 
     } else {
       // 1. Obtener los ítems de la venta para devolver stock (POS)
+      const [origenSeparado]: any = await conn.query(`SELECT id FROM facturas_venta fv WHERE fv.id = ? AND fv.empresa_id = ?
+        AND (fv.metodo_pago = 'Separado' OR EXISTS (SELECT 1 FROM kardex k WHERE k.empresa_id = fv.empresa_id
+          AND k.referencia = CONCAT('FS-', fv.id) AND k.motivo = 'Conversión Separado a Venta')) FOR UPDATE`, [facturaId, empresa_id]);
+      if (origenSeparado.length) {
+        await conn.rollback();
+        return res.status(409).json({ error: 'Factura de separado: conserve su trazabilidad. Use cambio de producto con el medio real del ajuste; no se admite borrado de esta factura.' });
+      }
       const [items]: any = await conn.query(
         "SELECT producto_id, cantidad FROM ventas WHERE factura_id = ? AND empresa_id = ? FOR UPDATE", 
         [facturaId, empresa_id]
@@ -534,7 +573,9 @@ router.post("/cambio-producto", verifyPermission("venta"), async (req: any, res:
 
     // 1. Validar que la factura es POS y pertenece a la empresa
     const [factura]: any = await conn.query(
-      "SELECT id FROM facturas_venta WHERE id = ? AND empresa_id = ?",
+      `SELECT id, (metodo_pago = 'Separado' OR EXISTS (SELECT 1 FROM kardex k WHERE k.empresa_id = fv.empresa_id
+        AND k.referencia = CONCAT('FS-', fv.id) AND k.motivo = 'Conversión Separado a Venta')) AS es_separado
+        FROM facturas_venta fv WHERE id = ? AND empresa_id = ? FOR UPDATE`,
       [factura_id, empresa_id]
     );
 
@@ -552,19 +593,42 @@ router.post("/cambio-producto", verifyPermission("venta"), async (req: any, res:
       throw new Error("El producto devuelto no pertenece a esta factura.");
     }
 
-    // 3. Reemplazar el producto en la factura: actualizar la fila en `ventas`
+    // 3. Reemplazar el producto en la factura: actualizar la fila en `ventas` con nueva cantidad y precio
     await conn.query(
-      "UPDATE ventas SET producto_id = ?, precio_unitario = ?, costo_unitario = (SELECT COALESCE(precio_compra, 0) FROM productos WHERE id = ?) WHERE id = ? AND empresa_id = ?",
-      [producto_nuevo_id, valor_nuevo, producto_nuevo_id, ventaDetalle[0].id, empresa_id]
+      "UPDATE ventas SET producto_id = ?, cantidad = ?, precio_unitario = ?, costo_unitario = (SELECT COALESCE(precio_compra, 0) FROM productos WHERE id = ?) WHERE id = ? AND empresa_id = ?",
+      [producto_nuevo_id, cantidad_nueva, valor_nuevo, producto_nuevo_id, ventaDetalle[0].id, empresa_id]
     );
 
-    // 4. Actualizar el total de la factura
-    const diferenciaPrecio = valor_nuevo - ventaDetalle[0].precio_unitario;
-    if (diferenciaPrecio !== 0) {
-      await conn.query(
-        "UPDATE facturas_venta SET total = total + ? WHERE id = ? AND empresa_id = ?",
-        [diferenciaPrecio * cantidad_devuelta, factura_id, empresa_id]
-      );
+    // 4. Actualizar el total de la factura y los importes de pago correspondientes
+    const cantDev = parseFloat(cantidad_devuelta) || 1;
+    const cantNue = parseFloat(cantidad_nueva) || 1;
+    const totalDevuelto = cantDev * (parseFloat(ventaDetalle[0].precio_unitario) || 0);
+    const totalNuevo = cantNue * (parseFloat(valor_nuevo) || 0);
+    const diferenciaCalculada = totalNuevo - totalDevuelto;
+    let diferenciaFinal = saldo_adicional !== undefined && saldo_adicional !== null && !isNaN(Number(saldo_adicional))
+      ? parseFloat(saldo_adicional)
+      : diferenciaCalculada;
+    if (factura[0].es_separado) {
+      if (!['Efectivo', 'Transferencia', 'Tarjeta', 'Addi', 'Sistecredito'].includes(metodo_pago)) throw new Error('Indique el medio real del ajuste de separado');
+      if (!Number.isSafeInteger(cantDev) || !Number.isSafeInteger(cantNue) || cantDev <= 0 || cantNue <= 0 || cantDev !== Number(ventaDetalle[0].cantidad)) throw new Error('El cambio de separado debe reemplazar la cantidad completa de la línea');
+      const deltaCentavos = cantNue * centavos(valor_nuevo) - cantDev * centavos(ventaDetalle[0].precio_unitario);
+      if (saldo_adicional !== undefined && saldo_adicional !== null && centavos(saldo_adicional) !== deltaCentavos) throw new Error('El ajuste monetario no coincide con los productos');
+      diferenciaFinal = deltaCentavos / 100;
+    }
+
+    if (diferenciaFinal !== 0) {
+      const esTransferencia = metodo_pago === 'Transferencia' || metodo_pago === 'Tarjeta' || metodo_pago === 'Addi' || metodo_pago === 'Sistecredito';
+      if (esTransferencia) {
+        await conn.query(
+          "UPDATE facturas_venta SET total = GREATEST(0, total + ?), pago_transferencia = GREATEST(0, pago_transferencia + ?) WHERE id = ? AND empresa_id = ?",
+          [diferenciaFinal, diferenciaFinal, factura_id, empresa_id]
+        );
+      } else {
+        await conn.query(
+          "UPDATE facturas_venta SET total = GREATEST(0, total + ?), pago_efectivo = GREATEST(0, pago_efectivo + ?) WHERE id = ? AND empresa_id = ?",
+          [diferenciaFinal, diferenciaFinal, factura_id, empresa_id]
+        );
+      }
     }
 
     // 5. Consultar y aumentar stock del producto devuelto
@@ -620,7 +684,7 @@ router.post("/cambio-producto", verifyPermission("venta"), async (req: any, res:
       `INSERT INTO cambios_factura 
       (empresa_id, factura_original_id, cajero_id, producto_devuelto_id, producto_nuevo_id, cantidad_devuelta, cantidad_nueva, valor_original, valor_nuevo, saldo_adicional, metodo_pago) 
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [empresa_id, factura_id, cId, producto_devuelto_id, producto_nuevo_id, cantidad_devuelta, cantidad_nueva, valor_original, valor_nuevo, saldo_adicional, metodo_pago || 'Efectivo']
+      [empresa_id, factura_id, cId, producto_devuelto_id, producto_nuevo_id, cantidad_devuelta, cantidad_nueva, valor_original, valor_nuevo, factura[0].es_separado ? diferenciaFinal : saldo_adicional, metodo_pago || 'Efectivo']
     );
 
     await conn.commit();

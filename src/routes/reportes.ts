@@ -1,4 +1,5 @@
 import express from "express";
+import { normalizarHistorico } from "../services/separadosCaja";
 import connection from "../conection";
 import { verifyTokenAndTenant } from "../middlewares/authMiddleware";
 
@@ -847,6 +848,7 @@ router.get("/abonos-separados", (req: any, res: any) => {
     runQuery(qCategorias, params)
   ])
     .then(([totals, byCajero, details, categoriasRaw]: any) => {
+      details = details.map(normalizarHistorico);
       const categoriasMap = new Map();
 
       categoriasRaw.forEach((row: any) => {
