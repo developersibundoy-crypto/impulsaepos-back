@@ -20,16 +20,20 @@ router.get("/", async (req: any, res: any) => {
 
   try {
     const queryVentas = `
-      SELECT cajero_id, SUM(comision) as total_comisiones
+      SELECT 
+        cajero_id, 
+        COALESCE(SUM(comision), 0) as total_comisiones,
+        COALESCE(SUM(subtotal_item), 0) as total_ventas,
+        COALESCE(SUM(CASE WHEN COALESCE(comision, 0) = 0 THEN subtotal_item ELSE 0 END), 0) as ventas_sin_comision
       FROM (
-        SELECT f.cajero_id, v.comision
+        SELECT f.cajero_id, v.comision, (v.cantidad * v.precio_unitario) as subtotal_item
         FROM ventas v
         JOIN facturas_venta f ON v.factura_id = f.id
         WHERE f.empresa_id = ? AND DATE(f.fecha) BETWEEN ? AND ?
         
         UNION ALL
         
-        SELECT fe.cajero_id, ve.comision
+        SELECT fe.cajero_id, ve.comision, (ve.cantidad * ve.precio_unitario) as subtotal_item
         FROM ventas_electronicas ve
         JOIN facturas_electronicas fe ON ve.factura_electronica_id = fe.id
         WHERE fe.empresa_id = ? AND DATE(fe.fecha_emision) BETWEEN ? AND ?
@@ -54,7 +58,21 @@ router.get("/", async (req: any, res: any) => {
 
     const nomina = (cajeros as any[]).map(cajero => {
       const ventaCajero = (ventas as any[]).find(v => v.cajero_id === cajero.id);
-      const comisiones = ventaCajero ? parseFloat(ventaCajero.total_comisiones) : 0;
+      const pagaComisiones = Boolean(cajero.paga_comisiones);
+      const percBase = parseFloat(cajero.porcentaje_comision_base) || 0;
+      const meta = parseFloat(cajero.meta_comision) || 0;
+      const percMeta = parseFloat(cajero.porcentaje_comision_meta) || 0;
+
+      const comisionesGuardadas = ventaCajero ? (parseFloat(ventaCajero.total_comisiones) || 0) : 0;
+      const totalVentas = ventaCajero ? (parseFloat(ventaCajero.total_ventas) || 0) : 0;
+      const ventasSinComision = ventaCajero ? (parseFloat(ventaCajero.ventas_sin_comision) || 0) : 0;
+
+      let comisiones = comisionesGuardadas;
+      if ((pagaComisiones || percBase > 0) && ventasSinComision > 0) {
+        const percAplicable = (meta > 0 && totalVentas > meta && percMeta > 0) ? percMeta : percBase;
+        const comisionRecalculada = Math.round((ventasSinComision * (percAplicable / 100)) * 100) / 100;
+        comisiones = Math.round((comisionesGuardadas + comisionRecalculada) * 100) / 100;
+      }
       
       const salario_base = parseFloat(cajero.salario) || 0;
       const total_a_pagar = salario_base + comisiones;
@@ -68,6 +86,7 @@ router.get("/", async (req: any, res: any) => {
         documento: cajero.documento,
         salario_base,
         salario_pagado: pagoRegistrado ? parseFloat(pagoRegistrado.salario_base) : null,
+        paga_comisiones: pagaComisiones,
         porcentaje_comision: cajero.porcentaje_comision_base,
         comisiones: pagoRegistrado ? parseFloat(pagoRegistrado.comisiones) : comisiones,
         total_a_pagar: pagoRegistrado ? parseFloat(pagoRegistrado.total_pagado) : total_a_pagar,

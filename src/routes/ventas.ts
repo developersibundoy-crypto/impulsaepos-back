@@ -245,6 +245,9 @@ router.get("/", verifyPermission("facturas_venta"), (req: any, res: any) => {
   const search = req.query.search as string || "";
   const filtro = req.query.filtro as string || "Todas";
   const tipo_factura = req.query.tipo_factura as string || "Todas";
+  const startDate = req.query.startDate as string || "";
+  const endDate = req.query.endDate as string || "";
+  const includeItems = req.query.includeItems === "true";
 
   let fromClause = "";
   const queryParams: any[] = [];
@@ -374,6 +377,15 @@ router.get("/", verifyPermission("facturas_venta"), (req: any, res: any) => {
     whereClause += " AND f.tipo_factura = 'POS' AND (f.metodo_pago = 'Separado' OR EXISTS (SELECT 1 FROM kardex k WHERE k.empresa_id = f.empresa_id AND k.referencia = CONCAT('FS-', f.id) AND k.motivo = 'Conversión Separado a Venta'))";
   }
 
+  if (startDate) {
+    whereClause += " AND DATE(f.fecha) >= ?";
+    queryParams.push(startDate);
+  }
+  if (endDate) {
+    whereClause += " AND DATE(f.fecha) <= ?";
+    queryParams.push(endDate);
+  }
+
   const countQuery = `
     SELECT COUNT(*) as total 
     FROM ${fromClause}
@@ -394,8 +406,57 @@ router.get("/", verifyPermission("facturas_venta"), (req: any, res: any) => {
     if (err) return res.status(500).json({ error: err.message });
     const total = countRes[0].total;
 
-    pool.query(dataQuery, [...queryParams, limit, offset], (err: any, results: any) => {
+    pool.query(dataQuery, [...queryParams, limit, offset], async (err: any, results: any) => {
       if (err) return res.status(500).json({ error: err.message });
+
+      if (includeItems && Array.isArray(results) && results.length > 0) {
+        try {
+          const promisePool = pool.promise();
+          const posIds = results.filter((r: any) => r.tipo_factura !== "ELECTRONICA").map((r: any) => r.id);
+          const elecIds = results.filter((r: any) => r.tipo_factura === "ELECTRONICA").map((r: any) => r.id);
+
+          const itemsMap = new Map<string, any[]>();
+
+          if (posIds.length > 0) {
+            const [posItems]: any = await promisePool.query(
+              `SELECT v.factura_id, v.producto_id, v.cantidad, v.precio_unitario, v.costo_unitario, v.comision, p.nombre, p.referencia, p.categoria
+               FROM ventas v
+               LEFT JOIN productos p ON v.producto_id = p.id
+               WHERE v.empresa_id = ? AND v.factura_id IN (?)`,
+              [empresa_id, posIds]
+            );
+            for (const it of posItems) {
+              const key = `POS_${it.factura_id}`;
+              if (!itemsMap.has(key)) itemsMap.set(key, []);
+              itemsMap.get(key)!.push(it);
+            }
+          }
+
+          if (elecIds.length > 0) {
+            const [elecItems]: any = await promisePool.query(
+              `SELECT v.factura_electronica_id AS factura_id, v.producto_id, v.cantidad, v.precio_unitario, p.precio_compra AS costo_unitario, p.nombre, p.referencia, p.categoria
+               FROM ventas_electronicas v
+               JOIN facturas_electronicas fe ON v.factura_electronica_id = fe.id
+               LEFT JOIN productos p ON v.producto_id = p.id
+               WHERE fe.empresa_id = ? AND v.factura_electronica_id IN (?)`,
+              [empresa_id, elecIds]
+            );
+            for (const it of elecItems) {
+              const key = `ELECTRONICA_${it.factura_id}`;
+              if (!itemsMap.has(key)) itemsMap.set(key, []);
+              itemsMap.get(key)!.push(it);
+            }
+          }
+
+          for (const r of results) {
+            const key = `${r.tipo_factura || "POS"}_${r.id}`;
+            r.productos = itemsMap.get(key) || [];
+          }
+        } catch (itemsErr: any) {
+          console.error("Error cargando productos de facturas:", itemsErr);
+        }
+      }
+
       res.json({
         data: results,
         total: total,
