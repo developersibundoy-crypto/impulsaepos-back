@@ -1,4 +1,5 @@
 import express from "express";
+import { enteroInventario } from "../utils/enteroInventario";
 import pool from "../conection";
 import { verifyTokenAndTenant } from "../middlewares/authMiddleware";
 import { centavos, distribuirAbono, distribuirDevolucion, registrarAbono, rastreoSeparados, normalizarHistorico, obtenerTurnoAbono, resumenFlujo } from "../services/separadosCaja";
@@ -176,7 +177,8 @@ router.post("/", async (req: any, res: any) => {
   const empresa_id = req.user.empresa_id;
   const { cliente_id, detalles, total, abono_inicial } = req.body;
   
-  if (!cliente_id || !detalles || total === undefined) {
+  if (!cliente_id || !Array.isArray(detalles) || !detalles.length || total === undefined ||
+      detalles.some(i=>!enteroInventario(i?.id)||!enteroInventario(i?.qty ?? i?.cantidad))) {
     return res.status(400).json({ error: "Faltan datos obligatorios: cliente, productos o total." });
   }
 
@@ -184,6 +186,7 @@ router.post("/", async (req: any, res: any) => {
   const conn = await promisePool.getConnection();
 
   try {
+    await conn.query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
     await conn.beginTransaction();
 
     centavos(total);
@@ -210,8 +213,7 @@ router.post("/", async (req: any, res: any) => {
 
     // 2. Reservar Stock de cada producto del carrito
     for (const item of detalles) {
-      const qty = parseInt(item.qty || item.cantidad || 0);
-      if (qty <= 0) continue;
+      const qty = enteroInventario(item.qty ?? item.cantidad);
 
       // Bloquear fila de producto filtrando SIEMPRE por empresa_id (SaaS Privacy)
       const [pData]: any = await conn.query(

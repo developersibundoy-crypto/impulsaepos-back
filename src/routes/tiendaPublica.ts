@@ -1,4 +1,5 @@
 import express from "express";
+import { enteroInventario } from "../utils/enteroInventario";
 import crypto from "crypto";
 import pool from "../conection";
 
@@ -273,7 +274,10 @@ router.post("/:slug/pedidos", async (req: any, res: any) => {
     const metodoEntrega = body.metodo_entrega === "acordar_vendedor" ? "acordar_vendedor" : "recogida";
     const metodoPago = body.metodo_pago === "efectivo_recogida" ? "efectivo_recogida" : "transferencia_manual";
     const notasCliente = body.notas_cliente ? String(body.notas_cliente).trim().slice(0, 500) : null;
-    const claveIdempotencia = body.clave_idempotencia ? String(body.clave_idempotencia).trim().slice(0, 64) : null;
+    const claveIdempotencia = body.clave_idempotencia;
+    if(typeof claveIdempotencia!=="string" || !/^[a-zA-Z0-9_-]{16,64}$/.test(claveIdempotencia)){
+      return res.status(400).json({ok:false,error:"CLAVE_INVALIDA",mensaje:"Falta una clave de checkout válida."});
+    }
     const rawItems = Array.isArray(body.items) ? body.items : [];
 
     if (!clienteNombre || clienteNombre.length < 2) {
@@ -289,18 +293,19 @@ router.post("/:slug/pedidos", async (req: any, res: any) => {
     // Normalizar y deduplicar items
     const itemsMap = new Map<number, number>();
     for (const item of rawItems) {
-      const pid = parseInt(String(item.producto_id), 10);
-      const qty = parseInt(String(item.cantidad), 10);
-      if (!Number.isSafeInteger(pid) || pid < 1 || !Number.isSafeInteger(qty) || qty < 1) {
+      const pid = enteroInventario(item?.producto_id);
+      const qty = enteroInventario(item?.cantidad);
+      if (!pid || !qty || !enteroInventario((itemsMap.get(pid) || 0) + qty)) {
         return res.status(400).json({ ok: false, error: "ITEM_INVALIDO", mensaje: "Revisa los productos y cantidades seleccionadas." });
       }
       itemsMap.set(pid, (itemsMap.get(pid) || 0) + qty);
     }
 
     // Manejo de idempotencia: Si ya existe un pedido con esta clave para la tienda, devolverlo sin duplicar
-    if (claveIdempotencia) {
-      const [pedidosExistentes]: any = await db.query(
-        `SELECT id, codigo_orden, token_seguimiento, total, estado, creado_en 
+    const huella=crypto.createHash("sha256").update(JSON.stringify([clienteNombre,clienteTelefono,clienteEmail,metodoEntrega,metodoPago,notasCliente,[...itemsMap].sort(([a],[b])=>a-b)])).digest("hex");
+    const recuperar=async (conexion:any)=>{
+      const [pedidosExistentes]: any = await conexion.query(
+        `SELECT id, codigo_orden, token_seguimiento, total, estado, creado_en, huella_checkout
          FROM tienda_pedidos 
          WHERE tienda_id = ? AND clave_idempotencia = ?
          LIMIT 1`,
@@ -308,10 +313,15 @@ router.post("/:slug/pedidos", async (req: any, res: any) => {
       );
       if (pedidosExistentes && pedidosExistentes.length > 0) {
         const existente = pedidosExistentes[0];
-        return res.json({
+        if(existente.huella_checkout!==huella){
+          res.status(409).json({ok:false,error:"INTENTO_DISTINTO",mensaje:"La clave ya corresponde a otro pedido. Revisa tu compra."});
+          return true;
+        }
+        res.json({
           ok: true,
           reutilizado: true,
           pedido: {
+            id: existente.id,
             codigo_orden: existente.codigo_orden,
             token_seguimiento: existente.token_seguimiento,
             total: existente.total,
@@ -319,12 +329,35 @@ router.post("/:slug/pedidos", async (req: any, res: any) => {
             creado_en: existente.creado_en
           }
         });
+        return true;
       }
-    }
+      return false;
+    };
+    if(await recuperar(db))return;
 
     // Iniciar transacción para garantizar consistencia atómica de stock y pedido
     conn = await pool.promise().getConnection();
+    await conn.query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
     await conn.beginTransaction();
+
+    // Adquirir primero la clave única: un reintento espera al COMMIT o ROLLBACK del
+    // primer envío, antes de evaluar un stock que ese envío podría haber agotado.
+    const fechaStr = new Date().toISOString().slice(2, 10).replace(/-/g, "");
+    const codigoOrden = `PED-${fechaStr}-${crypto.randomBytes(3).toString("hex").toUpperCase()}`;
+    const tokenSeguimiento = crypto.randomBytes(32).toString("hex");
+    const fechaLimitePago = new Date(Date.now() + 2 * 60 * 60 * 1000);
+    let pedidoId:number;
+    try{
+      const [r]=await conn.execute(`INSERT INTO tienda_pedidos
+        (empresa_id,tienda_id,codigo_orden,token_seguimiento,clave_idempotencia,huella_checkout,
+         cliente_nombre,cliente_telefono,cliente_email,metodo_entrega,metodo_pago,notas_cliente,fecha_limite_pago)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,[tienda.empresa_id,tienda.id,codigoOrden,tokenSeguimiento,claveIdempotencia,huella,
+          clienteNombre,clienteTelefono,clienteEmail,metodoEntrega,metodoPago,notasCliente,fechaLimitePago]);
+      pedidoId=r.insertId;
+    }catch(err:any){
+      if(err.code==="ER_DUP_ENTRY"){await conn.rollback();if(await recuperar(conn))return;}
+      throw err;
+    }
 
     // 1. Bloquear y verificar los productos publicados y disponibles
     const productIds = Array.from(itemsMap.keys());
@@ -393,41 +426,7 @@ router.post("/:slug/pedidos", async (req: any, res: any) => {
 
     const totalCalculado = subtotalCalculado; // Recogida en tienda tiene costo de envío 0
 
-    // Generar código de orden legible y token de seguimiento opaco y criptográfico
-    const fechaStr = new Date().toISOString().slice(2, 10).replace(/-/g, "");
-    const randomHex = crypto.randomBytes(3).toString("hex").toUpperCase();
-    const codigoOrden = `PED-${fechaStr}-${randomHex}`;
-    const tokenSeguimiento = crypto.randomBytes(32).toString("hex");
-
-    // Fecha límite de pago/reserva: 2 horas
-    const fechaLimitePago = new Date(Date.now() + 2 * 60 * 60 * 1000);
-
-    // 2. Insertar pedido
-    const [pedidoRes]: any = await conn.query(
-      `INSERT INTO tienda_pedidos 
-        (empresa_id, tienda_id, codigo_orden, token_seguimiento, clave_idempotencia,
-         cliente_nombre, cliente_telefono, cliente_email, metodo_entrega, metodo_pago,
-         estado, subtotal, total, notas_cliente, fecha_limite_pago)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pendiente', ?, ?, ?, ?)`,
-      [
-        tienda.empresa_id,
-        tienda.id,
-        codigoOrden,
-        tokenSeguimiento,
-        claveIdempotencia,
-        clienteNombre,
-        clienteTelefono,
-        clienteEmail,
-        metodoEntrega,
-        metodoPago,
-        subtotalCalculado,
-        totalCalculado,
-        notasCliente,
-        fechaLimitePago
-      ]
-    );
-
-    const pedidoId = pedidoRes.insertId;
+    await conn.execute('UPDATE tienda_pedidos SET subtotal=?,total=? WHERE id=?',[subtotalCalculado,totalCalculado,pedidoId]);
 
     // 3. Insertar items y registrar reservas descontando stock
     for (const item of itemsParaGuardar) {
@@ -453,6 +452,11 @@ router.post("/:slug/pedidos", async (req: any, res: any) => {
          WHERE id = ? AND empresa_id = ?`,
         [item.cantidad, item.producto_id, tienda.empresa_id]
       );
+      const antes = Number(prodRows.find(p=>p.id===item.producto_id).cantidad);
+      await conn.query(`INSERT INTO kardex
+        (empresa_id,producto_id,tipo_movimiento,motivo,referencia,cantidad_antes,cantidad_modificada,cantidad_despues)
+        VALUES (?,?,'SALIDA','Reserva pedido web',?,?,?,?)`,
+        [tienda.empresa_id,item.producto_id,codigoOrden,antes,-item.cantidad,antes-item.cantidad]);
     }
 
     await conn.commit();

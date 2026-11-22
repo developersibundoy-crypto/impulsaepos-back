@@ -3,6 +3,7 @@ import pool from "../conection";
 import { verifyTokenAndTenant, verifyPermission } from "../middlewares/authMiddleware";
 import puntosService from "../services/puntosService";
 import { centavos } from "../services/separadosCaja";
+import { enteroInventario } from "../utils/enteroInventario";
 
 const router = express.Router();
 
@@ -14,13 +15,16 @@ router.post("/", verifyPermission("venta"), async (req: any, res: any) => {
   const empresa_id = req.user.empresa_id;
   const { items, metodoPago, cajeroId, clienteId, total, iva, efectivoEntregado, transferenciaEntregada, vuelto } = req.body;
   
-  if (!items || items.length === 0) return res.status(400).json({ error: "Carrito vacío" });
+  if (!Array.isArray(items) || !items.length || items.some(i=>!enteroInventario(i?.id)||!enteroInventario(i?.qty))) {
+    return res.status(400).json({error:"El carrito requiere productos y cantidades enteras positivas."});
+  }
 
   const promisePool = pool.promise();
   let conn;
 
   try {
     conn = await promisePool.getConnection();
+    await conn.query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
     await conn.beginTransaction();
 
     // 0. Consultar configuración específica de la empresa
@@ -129,7 +133,7 @@ router.post("/", verifyPermission("venta"), async (req: any, res: any) => {
 
       // Validar stock antes de vender (si no es servicio y no se permite negativo)
       const [prodData]: any = await conn.query(
-        "SELECT cantidad, es_servicio, permitir_venta_negativa, precio_compra, nombre FROM productos WHERE id = ? AND empresa_id = ?",
+        "SELECT cantidad, es_servicio, permitir_venta_negativa, precio_compra, nombre FROM productos WHERE id = ? AND empresa_id = ? FOR UPDATE",
         [item.id, empresa_id]
       );
 
@@ -143,10 +147,17 @@ router.post("/", verifyPermission("venta"), async (req: any, res: any) => {
       const esServicio = !!producto.es_servicio;
 
       // Solo bloquear si no es servicio Y no se permite negativo (global o por producto)
-      if (!esServicio && !permitirNegativoGlobal && !permitirNegativoProd) {
-        if (stockDisponible < item.qty) {
-          throw new Error(`Stock insuficiente para: ${producto.nombre}. Disponible: ${stockDisponible}`);
+      if (!esServicio && stockDisponible < item.qty) {
+        let bloquear = !permitirNegativoGlobal && !permitirNegativoProd;
+        if (!bloquear) {
+          // El POS puede vender en negativo productos no compartidos; no las unidades
+          // comprometidas para web o separados. Leer el estado tras el bloqueo de producto.
+          const [publicado]: any = await conn.query(
+            "SELECT 1 FROM tienda_publicaciones WHERE producto_id=? AND empresa_id=? AND visible=1 LIMIT 1",
+            [item.id, empresa_id]);
+          bloquear = publicado.length > 0;
         }
+        if (bloquear) throw Object.assign(new Error(`Stock insuficiente para: ${producto.nombre}. Disponible: ${stockDisponible}`), {status:409});
       }
 
       // --- CÁLCULO DE COMISIÓN ITEMIZADA ---
@@ -229,7 +240,7 @@ router.post("/", verifyPermission("venta"), async (req: any, res: any) => {
   } catch (error: any) {
     if (conn) await conn.rollback();
     console.error("Error en procesamiento de venta:", error);
-    res.status(500).json({ error: error.message || "Error al procesar la venta" });
+    res.status(error.status || 500).json({ error: error.message || "Error al procesar la venta" });
   } finally {
     if (conn) conn.release();
   }

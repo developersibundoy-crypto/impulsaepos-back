@@ -1,4 +1,5 @@
 import express from "express";
+import { liberarStockPedido } from "../services/liberarStockPedido";
 import pool from "../conection";
 import { verifyTokenAndTenant } from "../middlewares/authMiddleware";
 
@@ -503,6 +504,7 @@ router.put("/pedidos/:id/estado", async (req: any, res: any) => {
     }
 
     conn = await pool.promise().getConnection();
+    await conn.query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
     await conn.beginTransaction();
 
     // 9.1 Bloquear pedido y verificar que pertenece a la empresa
@@ -528,31 +530,23 @@ router.put("/pedidos/:id/estado", async (req: any, res: any) => {
     }
 
     // 9.2 Tratamiento especial al cancelar: Reintegrar stock y liberar reserva
-    if (nuevo_estado === "cancelado" && estadoAnterior !== "cancelado") {
-      // Obtener items para reintegrar stock
-      const [items]: any = await conn.query(
-        "SELECT producto_id, cantidad FROM tienda_pedido_items WHERE pedido_id = ?",
-        [pedidoId]
-      );
-
-      for (const item of items) {
-        await conn.query(
-          "UPDATE productos SET cantidad = cantidad + ? WHERE id = ? AND empresa_id = ?",
-          [item.cantidad, item.producto_id, empresaId]
-        );
-      }
-
-      // Marcar reservas como canceladas/liberadas
-      await conn.query(
-        "UPDATE tienda_reservas SET estado = 'cancelada' WHERE pedido_id = ? AND empresa_id = ?",
-        [pedidoId, empresaId]
-      );
+    const siguientes: Record<string,string[]> = {
+      pendiente:["confirmado","cancelado"], comprobante_enviado:["confirmado","cancelado"],
+      confirmado:["preparando","listo_recogida","cancelado"], preparando:["listo_recogida","cancelado"],
+      listo_recogida:["entregado","cancelado"]
+    };
+    if (!siguientes[estadoAnterior]?.includes(nuevo_estado)) {
+      await conn.rollback();
+      return res.status(409).json({error:`No se puede pasar de ${estadoAnterior} a ${nuevo_estado}.`});
+    }
+    if (nuevo_estado === "cancelado") {
+      await liberarStockPedido(conn,pedidoId,empresaId,pedido.codigo_orden,"cancelada");
     }
 
     // 9.3 Tratamiento especial al entregar: Consolidar reserva
     if (nuevo_estado === "entregado") {
       await conn.query(
-        "UPDATE tienda_reservas SET estado = 'consolidada' WHERE pedido_id = ? AND empresa_id = ?",
+        "UPDATE tienda_reservas SET estado = 'consolidada' WHERE pedido_id = ? AND empresa_id = ? AND estado='activa'",
         [pedidoId, empresaId]
       );
     }

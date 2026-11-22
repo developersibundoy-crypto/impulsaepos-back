@@ -230,6 +230,7 @@ async function run() {
       method: 'POST',
       body: {
         cliente_nombre: 'Comprador Excesivo',
+        clave_idempotencia: require('crypto').randomUUID(),
         cliente_telefono: '3000000000',
         items: [{ producto_id: productoId, cantidad: 50 }] // Disponible 7
       }
