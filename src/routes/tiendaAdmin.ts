@@ -1,12 +1,40 @@
 import express from "express";
 import { liberarStockPedido } from "../services/liberarStockPedido";
 import pool from "../conection";
-import { verifyTokenAndTenant } from "../middlewares/authMiddleware";
+import { verifyTokenAndTenant, tienePermiso } from "../middlewares/authMiddleware";
+import { enmascararSecreto, validarFormatoLlaves } from "../services/tiendaWompiService";
+
 
 const router = express.Router();
 
+// Módulos de permiso de la tienda:
+//  - tienda_admin: configura/publica, valida pagos, cancela pedidos (dueño/administrador).
+//  - tienda_operacion: consulta pedidos y avanza preparación/entrega (operador).
+const MODULO_ADMIN = "tienda_admin";
+const MODULO_OPERACION = "tienda_operacion";
+
 // Todas las rutas de administración de la tienda requieren sesión administrativa del comercio
 router.use(verifyTokenAndTenant);
+
+// Exige al menos uno de los módulos indicados; la autorización la decide el servidor, no la interfaz.
+const requiere = (...modulos: string[]) => (req: any, res: any, next: any) => {
+  if (modulos.some((m) => tienePermiso(req.user, m))) return next();
+  console.warn(`[TIENDA_ADMIN] Acceso denegado: usuario ${req.user?.username} (empresa ${req.user?.empresa_id}) requiere ${modulos.join(" o ")}.`);
+  return res.status(403).json({ error: "No tienes permiso para realizar esta acción en la tienda." });
+};
+
+// Deja constancia (fuera de la transacción revertida) de un intento no autorizado sobre un pedido.
+async function registrarDenegacion(empresaId: number, pedidoId: number, user: any, de: string, a: string) {
+  try {
+    await pool.promise().query(
+      `INSERT INTO tienda_auditoria (empresa_id, entidad, entidad_id, accion, actor_tipo, actor_id, detalle)
+       VALUES (?, 'pedido', ?, 'cambio_estado_denegado', 'usuario', ?, ?)`,
+      [empresaId, pedidoId, user?.id || null, JSON.stringify({ estado_anterior: de, nuevo_estado: a, rol: user?.role || null })]
+    );
+  } catch (e) {
+    console.error("[TIENDA_ADMIN] No se pudo auditar la denegación:", e);
+  }
+}
 
 // Middleware para verificar que req.user tiene empresa_id
 const getEmpresaId = (req: any): number => {
@@ -29,7 +57,7 @@ export function normalizarSlug(texto: string): string {
 }
 
 // 1. Obtener la tienda de la empresa (o inicializar borrador si es la primera vez)
-router.get("/mi-tienda", async (req: any, res: any) => {
+router.get("/mi-tienda", requiere(MODULO_ADMIN, MODULO_OPERACION), async (req: any, res: any) => {
   try {
     const empresaId = getEmpresaId(req);
     const db = pool.promise();
@@ -90,7 +118,7 @@ router.get("/mi-tienda", async (req: any, res: any) => {
 });
 
 // 2. Actualizar datos de identidad y configuración de la tienda
-router.put("/mi-tienda", async (req: any, res: any) => {
+router.put("/mi-tienda", requiere(MODULO_ADMIN), async (req: any, res: any) => {
   try {
     const empresaId = getEmpresaId(req);
     const { nombre, slug, descripcion, logo_url, correo_contacto, telefono_contacto, color_primario, direccion_recogida, horario_atencion, banner_url, tagline } = req.body;
@@ -158,8 +186,123 @@ router.put("/mi-tienda", async (req: any, res: any) => {
   }
 });
 
+// 2.5 Obtener configuración de pasarelas de pago (Wompi)
+router.get("/mi-tienda/pagos-config", requiere(MODULO_ADMIN), async (req: any, res: any) => {
+  try {
+    const empresaId = getEmpresaId(req);
+    const db = pool.promise();
+
+    const [tiendas]: any = await db.query("SELECT id FROM tiendas WHERE empresa_id = ?", [empresaId]);
+    if (!tiendas.length) {
+      return res.status(404).json({ error: "Tienda no encontrada." });
+    }
+    const tiendaId = tiendas[0].id;
+
+    const [rows]: any = await db.query(
+      `SELECT activo, ambiente, public_key, integrity_secret, event_secret 
+       FROM tienda_pasarelas_config 
+       WHERE tienda_id = ? AND empresa_id = ? AND proveedor = 'wompi' LIMIT 1`,
+      [tiendaId, empresaId]
+    );
+
+    const config = rows[0] || {};
+    const proto = req.headers["x-forwarded-proto"] || req.protocol || "http";
+    const host = req.headers["x-forwarded-host"] || req.get("host") || "localhost";
+    const webhookUrl = `${proto}://${host}/api/tienda-publica/wompi-webhook`;
+
+    res.json({
+      activo: Boolean(config.activo),
+      ambiente: config.ambiente || "sandbox",
+      public_key: config.public_key || "",
+      integrity_secret_enmascarado: enmascararSecreto(config.integrity_secret),
+      event_secret_enmascarado: enmascararSecreto(config.event_secret),
+      tiene_integrity_secret: Boolean(config.integrity_secret),
+      tiene_event_secret: Boolean(config.event_secret),
+      webhook_url: webhookUrl
+    });
+  } catch (error: any) {
+    console.error("[TIENDA_ADMIN] Error consultando configuración de pagos:", error);
+    res.status(500).json({ error: error.message || "Error al consultar la configuración de pagos." });
+  }
+});
+
+// 2.6 Guardar configuración de pasarelas de pago (Wompi)
+router.put("/mi-tienda/pagos-config", requiere(MODULO_ADMIN), async (req: any, res: any) => {
+  try {
+    const empresaId = getEmpresaId(req);
+    const { activo, ambiente, public_key, integrity_secret, event_secret } = req.body;
+
+    const modoAmbiente = ambiente === "produccion" ? "produccion" : "sandbox";
+    const esActivo = Boolean(activo);
+    const db = pool.promise();
+
+    const [tiendas]: any = await db.query("SELECT id FROM tiendas WHERE empresa_id = ?", [empresaId]);
+    if (!tiendas.length) {
+      return res.status(404).json({ error: "Tienda no encontrada." });
+    }
+    const tiendaId = tiendas[0].id;
+
+    // Consultar secretos existentes por si no fueron reenviados (o vienen enmascarados)
+    const [existentes]: any = await db.query(
+      `SELECT public_key, integrity_secret, event_secret 
+       FROM tienda_pasarelas_config 
+       WHERE tienda_id = ? AND empresa_id = ? AND proveedor = 'wompi' LIMIT 1`,
+      [tiendaId, empresaId]
+    );
+    const anterior = existentes[0] || {};
+
+    let pkFinal = (typeof public_key === "string" ? public_key.trim() : anterior.public_key) || "";
+    let isFinal = (typeof integrity_secret === "string" && !integrity_secret.startsWith("••••") && integrity_secret.trim() !== ""
+      ? integrity_secret.trim()
+      : anterior.integrity_secret) || "";
+    let esFinal = (typeof event_secret === "string" && !event_secret.startsWith("••••") && event_secret.trim() !== ""
+      ? event_secret.trim()
+      : anterior.event_secret) || "";
+
+    if (esActivo) {
+      const validacion = validarFormatoLlaves(modoAmbiente, pkFinal, isFinal, esFinal);
+      if (!validacion.valido) {
+        return res.status(400).json({ error: validacion.error });
+      }
+      if (!isFinal || !esFinal) {
+        return res.status(400).json({ error: "Para activar Wompi debes configurar tanto el Secreto de Integridad como el Secreto de Eventos." });
+      }
+    }
+
+    await db.query(
+      `INSERT INTO tienda_pasarelas_config 
+         (tienda_id, empresa_id, proveedor, activo, ambiente, public_key, integrity_secret, event_secret)
+       VALUES (?, ?, 'wompi', ?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE 
+         activo = VALUES(activo),
+         ambiente = VALUES(ambiente),
+         public_key = VALUES(public_key),
+         integrity_secret = VALUES(integrity_secret),
+         event_secret = VALUES(event_secret)`,
+      [tiendaId, empresaId, esActivo ? 1 : 0, modoAmbiente, pkFinal, isFinal, esFinal]
+    );
+
+    // Registrar en auditoría
+    await db.query(
+      `INSERT INTO tienda_auditoria (empresa_id, entidad, entidad_id, accion, actor_tipo, actor_id, detalle)
+       VALUES (?, 'pasarela', ?, 'configurar_wompi', 'usuario', ?, ?)`,
+      [empresaId, tiendaId, req.user?.id || null, JSON.stringify({ activo: esActivo, ambiente: modoAmbiente, pk: pkFinal ? pkFinal.slice(0, 12) + "..." : null })]
+    );
+
+    res.json({
+      success: true,
+      message: "Configuración de Wompi guardada correctamente.",
+      activo: esActivo,
+      ambiente: modoAmbiente
+    });
+  } catch (error: any) {
+    console.error("[TIENDA_ADMIN] Error guardando configuración de pagos:", error);
+    res.status(500).json({ error: error.message || "Error al guardar la configuración de pagos." });
+  }
+});
+
 // 3. Cambiar estado de la tienda (borrador -> publicada <-> pausada)
-router.post("/mi-tienda/estado", async (req: any, res: any) => {
+router.post("/mi-tienda/estado", requiere(MODULO_ADMIN), async (req: any, res: any) => {
   try {
     const empresaId = getEmpresaId(req);
     const { nuevo_estado } = req.body;
@@ -213,7 +356,7 @@ router.post("/mi-tienda/estado", async (req: any, res: any) => {
 });
 
 // 4. Activar prueba gratuita de 14 días para la tienda
-router.post("/mi-tienda/activar-prueba", async (req: any, res: any) => {
+router.post("/mi-tienda/activar-prueba", requiere(MODULO_ADMIN), async (req: any, res: any) => {
   try {
     const empresaId = getEmpresaId(req);
     const db = pool.promise();
@@ -249,7 +392,7 @@ router.post("/mi-tienda/activar-prueba", async (req: any, res: any) => {
 });
 
 // 5. Listar productos del inventario con su estado de publicación en la tienda
-router.get("/productos", async (req: any, res: any) => {
+router.get("/productos", requiere(MODULO_ADMIN), async (req: any, res: any) => {
   try {
     const empresaId = getEmpresaId(req);
     const q = String(req.query.q || "").trim();
@@ -297,7 +440,7 @@ router.get("/productos", async (req: any, res: any) => {
 });
 
 // 6. Publicar o retirar un producto de la tienda (Toggle)
-router.post("/publicaciones/toggle", async (req: any, res: any) => {
+router.post("/publicaciones/toggle", requiere(MODULO_ADMIN), async (req: any, res: any) => {
   try {
     const empresaId = getEmpresaId(req);
     const productoId = Number(req.body?.producto_id);
@@ -346,7 +489,7 @@ router.post("/publicaciones/toggle", async (req: any, res: any) => {
 });
 
 // 7. Editar detalles públicos del producto en la tienda
-router.put("/publicaciones/:productoId", async (req: any, res: any) => {
+router.put("/publicaciones/:productoId", requiere(MODULO_ADMIN), async (req: any, res: any) => {
   try {
     const empresaId = getEmpresaId(req);
     const productoId = Number(req.params.productoId);
@@ -373,7 +516,7 @@ router.put("/publicaciones/:productoId", async (req: any, res: any) => {
 });
 
 // 8. Listar pedidos web de la empresa (Bandeja de pedidos del POS)
-router.get("/pedidos", async (req: any, res: any) => {
+router.get("/pedidos", requiere(MODULO_ADMIN, MODULO_OPERACION), async (req: any, res: any) => {
   try {
     const empresaId = getEmpresaId(req);
     const db = pool.promise();
@@ -482,7 +625,7 @@ router.get("/pedidos", async (req: any, res: any) => {
 });
 
 // 9. Actualizar estado de un pedido (Transición autorizada con liberación o consolidación de stock)
-router.put("/pedidos/:id/estado", async (req: any, res: any) => {
+router.put("/pedidos/:id/estado", requiere(MODULO_ADMIN, MODULO_OPERACION), async (req: any, res: any) => {
   let conn: any = null;
   try {
     const empresaId = getEmpresaId(req);
@@ -523,6 +666,14 @@ router.put("/pedidos/:id/estado", async (req: any, res: any) => {
 
     const pedido = pedidos[0];
     const estadoAnterior = pedido.estado;
+
+    // Validar pago y cancelar son decisiones del dueño: el operador solo avanza la preparación y la entrega.
+    // Se decide antes que cualquier otra respuesta (incluido el atajo de "mismo estado") para no confirmar nada al operador.
+    if ((nuevo_estado === "confirmado" || nuevo_estado === "cancelado") && !tienePermiso(req.user, MODULO_ADMIN)) {
+      await conn.rollback();
+      await registrarDenegacion(empresaId, pedidoId, req.user, estadoAnterior, nuevo_estado);
+      return res.status(403).json({ error: "Solo el dueño o administrador de la tienda puede validar pagos o cancelar pedidos." });
+    }
 
     if (estadoAnterior === nuevo_estado) {
       await conn.rollback();

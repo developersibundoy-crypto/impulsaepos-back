@@ -2,6 +2,8 @@ import express from "express";
 import { enteroInventario } from "../utils/enteroInventario";
 import crypto from "crypto";
 import pool from "../conection";
+import { calcularFirmaIntegridad, validarWebhookTienda } from "../services/tiendaWompiService";
+
 
 const router = express.Router();
 
@@ -74,6 +76,13 @@ router.get("/:slug", async (req: any, res: any) => {
 
     const t = resolucion.tienda;
 
+    // Consultar si la tienda tiene pasarela Wompi activa (solo se expone llave pública y ambiente)
+    const [pasarelas]: any = await db.query(
+      "SELECT activo, ambiente, public_key FROM tienda_pasarelas_config WHERE tienda_id = ? AND proveedor = 'wompi' AND activo = 1 LIMIT 1",
+      [t.id]
+    );
+    const wompiConfig = pasarelas[0] || null;
+
     // Solo devolver campos públicos (sin empresa_id ni metadatos internos)
     return res.json({
       ok: true,
@@ -88,7 +97,12 @@ router.get("/:slug", async (req: any, res: any) => {
         direccion_recogida: t.direccion_recogida || "",
         horario_atencion: t.horario_atencion || "",
         banner_url: t.banner_url || "",
-        tagline: t.tagline || ""
+        tagline: t.tagline || "",
+        wompi: wompiConfig ? {
+          activo: true,
+          ambiente: wompiConfig.ambiente,
+          public_key: wompiConfig.public_key
+        } : null
       }
     });
   } catch (err: any) {
@@ -272,11 +286,28 @@ router.post("/:slug/pedidos", async (req: any, res: any) => {
     const clienteTelefono = String(body.cliente_telefono || "").trim().slice(0, 50);
     const clienteEmail = body.cliente_email ? String(body.cliente_email).trim().slice(0, 150) : null;
     const metodoEntrega = body.metodo_entrega === "acordar_vendedor" ? "acordar_vendedor" : "recogida";
-    const metodoPago = body.metodo_pago === "efectivo_recogida" ? "efectivo_recogida" : "transferencia_manual";
+    const metodoPago = body.metodo_pago === "efectivo_recogida" 
+      ? "efectivo_recogida" 
+      : body.metodo_pago === "wompi" 
+        ? "wompi" 
+        : "transferencia_manual";
     const notasCliente = body.notas_cliente ? String(body.notas_cliente).trim().slice(0, 500) : null;
     const claveIdempotencia = body.clave_idempotencia;
     if(typeof claveIdempotencia!=="string" || !/^[a-zA-Z0-9_-]{16,64}$/.test(claveIdempotencia)){
       return res.status(400).json({ok:false,error:"CLAVE_INVALIDA",mensaje:"Falta una clave de checkout válida."});
+    }
+
+    // Si el método es Wompi, verificar que la tienda tenga la pasarela configurada y activa
+    let wompiConfig: any = null;
+    if (metodoPago === "wompi") {
+      const [pasarelas]: any = await db.query(
+        "SELECT activo, ambiente, public_key, integrity_secret FROM tienda_pasarelas_config WHERE tienda_id = ? AND proveedor = 'wompi' AND activo = 1 LIMIT 1",
+        [tienda.id]
+      );
+      if (!pasarelas.length || !pasarelas[0].public_key || !pasarelas[0].integrity_secret) {
+        return res.status(400).json({ ok: false, error: "WOMPI_NO_CONFIGURADO", mensaje: "El pago en línea con Wompi no está disponible para esta tienda." });
+      }
+      wompiConfig = pasarelas[0];
     }
     const rawItems = Array.isArray(body.items) ? body.items : [];
 
@@ -305,7 +336,7 @@ router.post("/:slug/pedidos", async (req: any, res: any) => {
     const huella=crypto.createHash("sha256").update(JSON.stringify([clienteNombre,clienteTelefono,clienteEmail,metodoEntrega,metodoPago,notasCliente,[...itemsMap].sort(([a],[b])=>a-b)])).digest("hex");
     const recuperar=async (conexion:any)=>{
       const [pedidosExistentes]: any = await conexion.query(
-        `SELECT id, codigo_orden, token_seguimiento, total, estado, creado_en, huella_checkout
+        `SELECT id, codigo_orden, token_seguimiento, total, estado, creado_en, huella_checkout, metodo_pago
          FROM tienda_pedidos 
          WHERE tienda_id = ? AND clave_idempotencia = ?
          LIMIT 1`,
@@ -317,6 +348,26 @@ router.post("/:slug/pedidos", async (req: any, res: any) => {
           res.status(409).json({ok:false,error:"INTENTO_DISTINTO",mensaje:"La clave ya corresponde a otro pedido. Revisa tu compra."});
           return true;
         }
+
+        let wompiRecuperado: any = null;
+        if (existente.metodo_pago === "wompi" && existente.estado === "pendiente") {
+          const [pas]: any = await conexion.query(
+            "SELECT public_key, ambiente, integrity_secret FROM tienda_pasarelas_config WHERE tienda_id = ? AND proveedor = 'wompi' AND activo = 1 LIMIT 1",
+            [tienda.id]
+          );
+          if (pas.length && pas[0].integrity_secret) {
+            const montoCentavos = Math.round(Number(existente.total) * 100);
+            wompiRecuperado = {
+              public_key: pas[0].public_key,
+              referencia: existente.codigo_orden,
+              monto_centavos: montoCentavos,
+              moneda: "COP",
+              firma_integridad: calcularFirmaIntegridad(existente.codigo_orden, montoCentavos, "COP", pas[0].integrity_secret),
+              ambiente: pas[0].ambiente
+            };
+          }
+        }
+
         res.json({
           ok: true,
           reutilizado: true,
@@ -327,7 +378,8 @@ router.post("/:slug/pedidos", async (req: any, res: any) => {
             total: existente.total,
             estado: existente.estado,
             creado_en: existente.creado_en
-          }
+          },
+          wompi: wompiRecuperado
         });
         return true;
       }
@@ -480,6 +532,20 @@ router.post("/:slug/pedidos", async (req: any, res: any) => {
       console.warn("No se pudo emitir evento socket de nuevo pedido:", socketErr);
     }
 
+    let wompiPayload: any = null;
+    if (metodoPago === "wompi" && wompiConfig) {
+      const montoCentavos = Math.round(totalCalculado * 100);
+      const firma = calcularFirmaIntegridad(codigoOrden, montoCentavos, "COP", wompiConfig.integrity_secret);
+      wompiPayload = {
+        public_key: wompiConfig.public_key,
+        referencia: codigoOrden,
+        monto_centavos: montoCentavos,
+        moneda: "COP",
+        firma_integridad: firma,
+        ambiente: wompiConfig.ambiente
+      };
+    }
+
     return res.status(201).json({
       ok: true,
       pedido: {
@@ -495,7 +561,8 @@ router.post("/:slug/pedidos", async (req: any, res: any) => {
         total: totalCalculado,
         fecha_limite_pago: fechaLimitePago,
         items: itemsParaGuardar
-      }
+      },
+      wompi: wompiPayload
     });
   } catch (err: any) {
     if (conn) await conn.rollback();
@@ -559,6 +626,8 @@ router.get("/:slug/pedidos/:token", async (req: any, res: any) => {
         total: p.total,
         notas_cliente: p.notas_cliente,
         comprobante_url: p.comprobante_url,
+        wompi_transaction_id: p.wompi_transaction_id,
+        wompi_estado: p.wompi_estado,
         fecha_limite_pago: p.fecha_limite_pago,
         creado_en: p.creado_en,
         items,
@@ -631,6 +700,135 @@ router.post("/:slug/pedidos/:token/comprobante", async (req: any, res: any) => {
   } catch (err: any) {
     console.error("Error en POST /tienda-publica/:slug/pedidos/:token/comprobante:", err);
     return res.status(500).json({ ok: false, error: "ERROR_SERVIDOR" });
+  }
+});
+
+// 7. Webhook universal para eventos de Wompi de tiendas en línea
+router.post("/wompi-webhook", async (req: any, res: any) => {
+  try {
+    const evento = req.body;
+    const dataTx = evento?.data?.transaction;
+    const reference = dataTx?.reference;
+
+    if (!reference || typeof reference !== "string") {
+      return res.status(200).json({ received: true, ignored: "SIN_REFERENCIA" });
+    }
+
+    const db = pool.promise();
+
+    // 1. Localizar el pedido por el código de orden
+    const [pedidos]: any = await db.query(
+      `SELECT p.id, p.empresa_id, p.tienda_id, p.codigo_orden, p.total, p.estado, p.wompi_transaction_id
+       FROM tienda_pedidos p 
+       WHERE p.codigo_orden = ? LIMIT 1`,
+      [reference]
+    );
+
+    if (!pedidos || pedidos.length === 0) {
+      return res.status(200).json({ received: true, ignored: "PEDIDO_NO_ENCONTRADO" });
+    }
+
+    const pedido = pedidos[0];
+
+    // 2. Obtener el secreto de eventos de la tienda
+    const [pasarelas]: any = await db.query(
+      `SELECT event_secret FROM tienda_pasarelas_config 
+       WHERE tienda_id = ? AND empresa_id = ? AND proveedor = 'wompi' LIMIT 1`,
+      [pedido.tienda_id, pedido.empresa_id]
+    );
+
+    if (!pasarelas || pasarelas.length === 0 || !pasarelas[0].event_secret) {
+      console.warn(`[WOMPI_TIENDA_WEBHOOK] Pedido ${reference} recibido pero la tienda no tiene event_secret configurado.`);
+      return res.status(200).json({ received: true, ignored: "PASARELA_SIN_SECRETO" });
+    }
+
+    const eventSecret = pasarelas[0].event_secret;
+
+    // 3. Validar la firma criptográfica del webhook
+    const esValido = validarWebhookTienda(evento, eventSecret);
+    if (!esValido) {
+      console.warn(`[WOMPI_TIENDA_WEBHOOK] Firma inválida rechazada para pedido ${reference} en tienda ${pedido.tienda_id}`);
+      return res.status(400).json({ error: "FIRMA_INVALIDA" });
+    }
+
+    // 4. Procesar el estado de la transacción
+    const txId = String(dataTx.id || "");
+    const status = String(dataTx.status || "");
+    const amountInCents = Number(dataTx.amount_in_cents);
+    const montoEsperadoCentavos = Math.round(Number(pedido.total) * 100);
+
+    if (status === "APPROVED") {
+      if (amountInCents !== montoEsperadoCentavos) {
+        console.warn(`[WOMPI_TIENDA_WEBHOOK] Inconsistencia de importe en pedido ${reference}: esperado ${montoEsperadoCentavos}, recibido ${amountInCents}`);
+      }
+
+      // Si no ha sido confirmado aún, pasarlo a confirmado y consolidar la reserva de stock
+      if (!["confirmado", "preparando", "listo_recogida", "entregado"].includes(pedido.estado)) {
+        const conn = await pool.promise().getConnection();
+        try {
+          await conn.beginTransaction();
+
+          await conn.query(
+            `UPDATE tienda_pedidos 
+             SET estado = 'confirmado', wompi_transaction_id = ?, wompi_estado = 'APPROVED'
+             WHERE id = ?`,
+            [txId, pedido.id]
+          );
+
+          await conn.query(
+            `UPDATE tienda_reservas 
+             SET estado = 'consolidada' 
+             WHERE pedido_id = ? AND estado = 'activa'`,
+            [pedido.id]
+          );
+
+          await conn.query(
+            `INSERT INTO tienda_auditoria (empresa_id, entidad, entidad_id, accion, actor_tipo, detalle)
+             VALUES (?, 'pedido', ?, 'pago_wompi_aprobado', 'sistema', ?)`,
+            [pedido.empresa_id, pedido.id, JSON.stringify({ wompi_id: txId, total_centavos: amountInCents, referencia: reference })]
+          );
+
+          await conn.commit();
+
+          // Notificar vía Socket al POS de la empresa
+          try {
+            const io = req.app.get("io");
+            if (io) {
+              io.to(`empresa_${pedido.empresa_id}`).emit("pedido_pagado_tienda", {
+                pedido_id: pedido.id,
+                codigo_orden: pedido.codigo_orden,
+                wompi_transaction_id: txId,
+                total: pedido.total
+              });
+            }
+          } catch (e) {}
+        } catch (txErr) {
+          await conn.rollback();
+          throw txErr;
+        } finally {
+          conn.release();
+        }
+      }
+    } else {
+      // Estado no aprobado (DECLINED, VOIDED, ERROR)
+      await db.query(
+        `UPDATE tienda_pedidos 
+         SET wompi_transaction_id = ?, wompi_estado = ? 
+         WHERE id = ?`,
+        [txId, status, pedido.id]
+      );
+
+      await db.query(
+        `INSERT INTO tienda_auditoria (empresa_id, entidad, entidad_id, accion, actor_tipo, detalle)
+         VALUES (?, 'pedido', ?, 'pago_wompi_fallido', 'sistema', ?)`,
+        [pedido.empresa_id, pedido.id, JSON.stringify({ wompi_id: txId, status, referencia: reference })]
+      );
+    }
+
+    return res.json({ success: true, reference, status });
+  } catch (err: any) {
+    console.error("[WOMPI_TIENDA_WEBHOOK] Error procesando webhook:", err);
+    return res.status(500).json({ error: "ERROR_SERVIDOR" });
   }
 });
 

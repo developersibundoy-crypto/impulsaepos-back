@@ -31,6 +31,24 @@ export const verifyTokenAndTenant = (req: any, res: any, next: any) => {
 };
 
 /**
+ * Evalúa si un usuario del token tiene acceso a un módulo (misma semántica que verifyPermission).
+ * Superadmin, permisos 'all' y admin/dueño sin lista explícita tienen acceso total.
+ */
+export const tienePermiso = (user: any, module: string): boolean => {
+  if (!user) return false;
+  if (user.role === 'superadmin' || user.permisos === 'all') return true;
+  if (user.role === 'admin' || user.role === 'dueño') {
+    if (!user.permisos || user.permisos === "" || user.permisos === "null") return true;
+  }
+  try {
+    const list = JSON.parse(user.permisos || "[]");
+    return Array.isArray(list) && list.includes(module);
+  } catch (e) {
+    return false;
+  }
+};
+
+/**
  * Middleware para validar permisos específicos por módulo.
  * @param module Nombre del módulo a validar (ej: 'ingreso', 'ventas', 'reportes')
  */
