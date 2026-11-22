@@ -30,15 +30,24 @@ import sorteo from "./routes/sorteo";
 
 import { createServer } from "http";
 import { Server } from "socket.io";
+import jwt from "jsonwebtoken";
+import tiendaPiloto from "./routes/tiendaPiloto";
+import tiendaAdmin from "./routes/tiendaAdmin";
+import tiendaPublica from "./routes/tiendaPublica";
+import { iniciarWorkerReservas } from "./services/tiendaReservasWorker";
 
 const app = express();
 const httpServer = createServer(app);
+// CORS_ORIGINS (lista separada por comas) restringe los orígenes del navegador. Sin definir, se mantiene
+// "*" para no romper despliegues existentes: la autenticación del socket la da el JWT, no el origen.
+const corsOrigins = (process.env.CORS_ORIGINS || "").split(",").map((o) => o.trim()).filter(Boolean);
 const io = new Server(httpServer, {
   cors: {
-    origin: "*",
+    origin: corsOrigins.length ? corsOrigins : "*",
     methods: ["GET", "POST", "PUT", "DELETE"]
   }
 });
+app.set("io", io);
 
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
@@ -50,21 +59,52 @@ app.use((req: any, _res, next) => {
   next();
 });
 
-io.on("connection", (socket) => {
-  console.log(`[SOCKET]: Nuevo cliente conectado - ID: ${socket.id}`);
+// Autenticación del handshake: sin un JWT válido no se establece la conexión.
+io.use((socket, next) => {
+  const token = socket.handshake.auth?.token;
+  if (typeof token !== "string" || !token || !process.env.JWT_SECRET) {
+    return next(new Error("No autorizado"));
+  }
+  jwt.verify(token, process.env.JWT_SECRET, (err: any, decoded: any) => {
+    if (err || !decoded) return next(new Error("No autorizado"));
+    const empresaId = Number(decoded.empresa_id);
+    if (!Number.isSafeInteger(empresaId) || empresaId < 1) return next(new Error("No autorizado"));
+    socket.data.empresaId = empresaId;
+    socket.data.expiraEn = typeof decoded.exp === "number" ? decoded.exp * 1000 : null;
+    next();
+  });
+});
 
-  // Unirse a una sala por empresa para no mezclar datos si hubiera múltiples empresas
-  socket.on("join_empresa", (empresaId) => {
-    socket.join(`empresa_${empresaId}`);
-    console.log(`[SOCKET]: Cliente ${socket.id} unido a sala empresa_${empresaId}`);
+io.on("connection", (socket) => {
+  const empresaId: number = socket.data.empresaId;
+  // La sala sale de la identidad verificada, nunca de lo que envíe el cliente.
+  socket.join(`empresa_${empresaId}`);
+  console.log(`[SOCKET]: Cliente ${socket.id} autenticado en sala empresa_${empresaId}`);
+
+  // Cerrar la conexión cuando el token expira, para no dejar sesiones vencidas con acceso a eventos.
+  let temporizador: NodeJS.Timeout | null = null;
+  if (socket.data.expiraEn) {
+    const ms = Math.max(0, socket.data.expiraEn - Date.now());
+    temporizador = setTimeout(() => socket.disconnect(true), Math.min(ms, 2 ** 31 - 1));
+  }
+
+  // Compatibilidad con clientes anteriores: solo se acepta la empresa del propio token.
+  socket.on("join_empresa", (id) => {
+    if (Number(id) !== empresaId) {
+      console.warn(`[SOCKET]: Cliente ${socket.id} intentó unirse a una sala ajena (empresa ${String(id).slice(0, 20)}).`);
+    }
   });
 
   socket.on("disconnect", () => {
+    if (temporizador) clearTimeout(temporizador);
     console.log(`[SOCKET]: Cliente desconectado - ID: ${socket.id}`);
   });
 });
 
 app.use("/productos", productos);
+app.use("/tienda-piloto", tiendaPiloto);
+app.use("/tienda-admin", tiendaAdmin);
+app.use("/tienda-publica", tiendaPublica);
 app.use("/ventas", ventas);
 app.use("/borradores", borradores);
 app.use("/cajeros", cajeros);
@@ -93,4 +133,5 @@ app.use("/sorteo", sorteo);
 const PORT = process.env.PORT || 4000;
 httpServer.listen(PORT, () => {
   console.log(`Servidor corriendo en puerto ${PORT} con Socket.io habilitado`);
+  iniciarWorkerReservas(io);
 });

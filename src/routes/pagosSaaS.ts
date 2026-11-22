@@ -2,66 +2,77 @@ import express from "express";
 import connection from "../conection";
 import crypto from "crypto";
 import { verifyTokenAndTenant, verifySuperAdmin } from "../middlewares/authMiddleware";
+import { firmaValida } from "../services/wompiEventos";
+import { registrarPagoAprobado, activarManual } from "../services/pagosSaasService";
 
 const router = express.Router();
 
-// NOTA: Wompi requiere un endpoint público para mandar el Evento (No requiere Token JWT local)
+// NOTA: Wompi requiere un endpoint público para mandar el Evento (No requiere Token JWT local).
+// La autenticidad se garantiza verificando la firma del evento con el "secreto de eventos" configurado
+// en plataforma_config (wompi_event_secret). Sin secreto configurado el endpoint no procesa nada.
 // Webhook URL a configurar en el Dashboard de Wompi: https://tudominio.com/api/suscripciones/wompi-webhook
-router.post("/wompi-webhook", (req: any, res: any) => {
+router.post("/wompi-webhook", async (req: any, res: any) => {
   const evento = req.body;
+  try {
+    const [cfg]: any = await connection.promise().query(
+      "SELECT wompi_event_secret, precio_mes_centavos, precio_semestre_centavos, precio_anio_centavos FROM plataforma_config WHERE id = 1"
+    );
+    const config = cfg[0] || {};
+    const secreto: string = config.wompi_event_secret || "";
 
-  if (evento && evento.event === "transaction.updated") {
-    const transaction = evento.data.transaction;
-
-    // Solo si la transacción es aprobada
-    if (transaction.status === "APPROVED") {
-      const { reference, id: wompiTxId, amount_in_cents } = transaction;
-      const parts = reference.split("_");
-      if (parts[0] === "SUB" && parts[1]) {
-        let dias = 30;
-        let empresa_id = 0;
-
-        // Nuevo formato: SUB_DIAS_EMPRESAID_TIMESTAMP
-        // Antiguo formato: SUB_EMPRESAID_TIMESTAMP
-        if (parts.length >= 4) {
-           dias = parseInt(parts[1], 10);
-           empresa_id = parseInt(parts[2], 10);
-        } else {
-           empresa_id = parseInt(parts[1], 10);
-           // Fallback por monto si es formato antiguo
-           const monto = amount_in_cents / 100;
-           if (monto === 378000) dias = 180;
-           else if (monto === 672000) dias = 365;
-        }
-
-        const montoPesos = amount_in_cents / 100;
-
-        // Registrar Pago
-        const qPago = "INSERT INTO pagos_suscripcion (empresa_id, wompi_transaction_id, monto, dias_agregados) VALUES (?, ?, ?, ?)";
-        connection.query(qPago, [empresa_id, wompiTxId, montoPesos, dias], (err: any) => {
-          if (err) console.error("Error registrando pago en BD", err);
-          
-          // Sumar X días a su fecha de vencimiento o desde HOY si estaba expirado
-          const qActualizarSuscripcion = `
-            UPDATE empresas_suscritas 
-            SET estado = 'Active',
-            fecha_vencimiento_suscripcion = CASE 
-                WHEN fecha_vencimiento_suscripcion < CURRENT_DATE() THEN DATE_ADD(CURRENT_DATE(), INTERVAL ? DAY)
-                ELSE DATE_ADD(fecha_vencimiento_suscripcion, INTERVAL ? DAY)
-            END
-            WHERE id = ?
-          `;
-          connection.query(qActualizarSuscripcion, [dias, dias, empresa_id], (err2: any) => {
-             if(err2) console.error("Error renovando la tienda", err2);
-             console.log(`[WOMPI] Suscripción pagada éxito: Empresa #${empresa_id} pagó $${montoPesos} por ${dias} días.`);
-          });
-        });
-      }
+    if (!secreto) {
+      // 503: Wompi reintentará cuando el administrador configure el secreto. Nunca se procesa sin verificar.
+      console.error("[WOMPI] Evento recibido pero wompi_event_secret no está configurado: no se procesa.");
+      return res.status(503).json({ error: "Eventos de pasarela no configurados." });
     }
-  }
+    if (!firmaValida(evento, secreto)) {
+      console.warn("[WOMPI] Evento rechazado: firma inválida.");
+      return res.status(401).json({ error: "Firma inválida." });
+    }
 
-  // Wompi exige respuesta 200 rápida
-  res.status(200).send("OK");
+    // Solo interesan las transacciones aprobadas; el resto se confirma sin efecto.
+    const transaction = evento?.data?.transaction;
+    if (evento.event !== "transaction.updated" || !transaction || transaction.status !== "APPROVED") {
+      return res.status(200).send("OK");
+    }
+
+    const eventoId = String(transaction.id ?? "");
+    const montoCentavos = Number(transaction.amount_in_cents);
+    if (!/^[A-Za-z0-9_-]{1,100}$/.test(eventoId) || !Number.isSafeInteger(montoCentavos) || montoCentavos <= 0) {
+      console.warn("[WOMPI] Evento firmado pero con transacción mal formada.");
+      return res.status(400).json({ error: "Transacción mal formada." });
+    }
+
+    const resultado = await registrarPagoAprobado(
+      connection.promise(),
+      {
+        proveedor: "wompi",
+        eventoId,
+        referencia: transaction.reference,
+        montoCentavos,
+        moneda: String(transaction.currency || ""),
+      },
+      {
+        mes: Number(config.precio_mes_centavos),
+        semestre: Number(config.precio_semestre_centavos),
+        anio: Number(config.precio_anio_centavos),
+      }
+    );
+
+    if (resultado.estado === "aplicado") {
+      console.log(`[WOMPI] Suscripción pagada: empresa #${resultado.empresaId}, ${resultado.dias} días (tx ${eventoId}).`);
+    } else if (resultado.estado === "conciliar") {
+      console.warn(`[WOMPI] Pago ${eventoId} guardado para conciliación manual: ${resultado.motivo}.`);
+    } else if (resultado.estado === "duplicado") {
+      console.log(`[WOMPI] Evento ${eventoId} ya procesado: sin cambios.`);
+    }
+    // Wompi exige respuesta 200 rápida; un duplicado también es un éxito.
+    return res.status(200).send("OK");
+  } catch (err) {
+    // Error transitorio (BD caída, etc.): 500 para que Wompi reintente. Es seguro porque es idempotente.
+    console.error("[WOMPI] Error procesando evento:", err);
+    return res.status(500).json({ error: "Error procesando el evento." });
+  }
 });
 
 // Endpoint para obtener estado de la suscripción (Protegido para el Front de cada Tenant)
@@ -218,68 +229,38 @@ router.post("/superadmin/config", verifySuperAdmin, (req: any, res: any) => {
 });
 
 // Endpoint exclusivo Super Administrador: ACTIVACIÓN MANUAL (Para pagos en físico)
-router.post("/superadmin/activar-manual", verifySuperAdmin, (req: any, res: any) => {
-  const { empresa_id, dias, monto } = req.body;
+router.post("/superadmin/activar-manual", verifySuperAdmin, async (req: any, res: any) => {
+  const empresaId = Number(req.body?.empresa_id);
+  const dias = Number(req.body?.dias);
+  const monto = req.body?.monto === undefined || req.body?.monto === "" ? 0 : Number(req.body.monto);
 
-  if (!empresa_id || !dias) {
-    return res.status(400).json({ error: "Faltan datos requeridos (ID empresa o días)." });
+  if (!Number.isSafeInteger(empresaId) || empresaId < 1 || !Number.isSafeInteger(dias) || dias < 1 || dias > 3660) {
+    return res.status(400).json({ error: "Datos inválidos: empresa_id debe ser un entero positivo y dias un entero entre 1 y 3660." });
+  }
+  if (!Number.isFinite(monto) || monto < 0 || monto > 1e12) {
+    return res.status(400).json({ error: "El monto debe ser un número mayor o igual a cero." });
   }
 
-  // 1. Registrar el pago en el historial como 'MANUAL_SUPERADMIN'
-  const qPago = "INSERT INTO pagos_suscripcion (empresa_id, wompi_transaction_id, monto, dias_agregados) VALUES (?, ?, ?, ?)";
-  connection.query(qPago, [empresa_id, 'MANUAL_SUPERADMIN', monto || 0, dias], (err: any) => {
-    if (err) {
-      console.error("Error registrando pago manual:", err);
-      return res.status(500).json({ error: "Error técnico al registrar el pago manual." });
-    }
-    
-    // 2. Actualizar la fecha de vencimiento de la empresa
-    // Si ya está vencida, sumamos desde hoy. Si no, sumamos a la fecha actual de vencimiento.
-    const qActualizarSuscripcion = `
-      UPDATE empresas_suscritas 
-      SET estado = 'Active',
-      fecha_vencimiento_suscripcion = CASE 
-          WHEN fecha_vencimiento_suscripcion < CURRENT_DATE() THEN DATE_ADD(CURRENT_DATE(), INTERVAL ? DAY)
-          ELSE DATE_ADD(fecha_vencimiento_suscripcion, INTERVAL ? DAY)
-      END
-      WHERE id = ?
-    `;
-    connection.query(qActualizarSuscripcion, [dias, dias, empresa_id], (err2: any) => {
-       if(err2) {
-         console.error("Error actualizando vencimiento:", err2);
-         return res.status(500).json({ error: "Error actualizando la fecha de vencimiento." });
-       }
-       res.json({ success: true, message: `Activación manual de ${dias} días para la empresa #${empresa_id} completada exitosamente.` });
+  try {
+    // Registro del pago y extensión de la suscripción en una sola transacción.
+    const resultado = await activarManual(connection.promise(), {
+      empresaId, dias, monto,
+      operador: String(req.user?.username || "superadmin"),
+      idOperacion: `MANUAL_${crypto.randomUUID()}`,
     });
-  });
+    if (!resultado.ok) return res.status(404).json({ error: (resultado as any).motivo });
+    res.json({ success: true, message: `Activación manual de ${dias} días para la empresa #${empresaId} completada exitosamente.` });
+  } catch (err) {
+    console.error("Error en activación manual:", err);
+    res.status(500).json({ error: "Error técnico al registrar la activación manual." });
+  }
 });
 
 // --- MÓDULO DE GASTOS / SALIDAS DE DINERO SAAS (SUPER ADMIN) ---
-
-// Asegurar tabla de salidas de dinero SaaS
-const asegurarTablaGastosSaaS = () => {
-  const query = `
-    CREATE TABLE IF NOT EXISTS saas_gastos (
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      categoria VARCHAR(100) NOT NULL,
-      descripcion TEXT NOT NULL,
-      monto DECIMAL(15,2) NOT NULL,
-      fecha DATE NOT NULL,
-      metodo_pago VARCHAR(100) DEFAULT 'Transferencia',
-      comprobante_url LONGTEXT NULL,
-      creado_por VARCHAR(100) DEFAULT 'superadmin',
-      fecha_registro TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-  `;
-  connection.query(query, (err) => {
-    if (err) console.error("Error asegurando tabla saas_gastos:", err);
-  });
-};
-asegurarTablaGastosSaaS();
+// La tabla saas_gastos la crea la migración 20261120_001_pagos_saas_eventos (no se hace DDL en peticiones).
 
 // Listar todas las salidas de dinero
 router.get("/superadmin/gastos", verifySuperAdmin, (req: any, res: any) => {
-  asegurarTablaGastosSaaS();
   connection.query(
     "SELECT * FROM saas_gastos ORDER BY fecha DESC, id DESC",
     (err: any, results: any[]) => {
@@ -294,7 +275,6 @@ router.get("/superadmin/gastos", verifySuperAdmin, (req: any, res: any) => {
 
 // Crear nueva salida de dinero
 router.post("/superadmin/gastos", verifySuperAdmin, (req: any, res: any) => {
-  asegurarTablaGastosSaaS();
   const { categoria, descripcion, monto, fecha, metodo_pago, comprobante_url } = req.body;
 
   if (!categoria || !descripcion || !monto) {

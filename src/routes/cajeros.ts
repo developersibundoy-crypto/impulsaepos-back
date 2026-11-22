@@ -1,12 +1,21 @@
 import express from "express";
 import connection from "../conection";
-import { verifyTokenAndTenant } from "../middlewares/authMiddleware";
+import { verifyTokenAndTenant, verifyPermission } from "../middlewares/authMiddleware";
 import bcrypt from 'bcryptjs';
 
 const router = express.Router();
 
 // Todas las rutas de cajeros requieren autenticación y Tenant
 router.use(verifyTokenAndTenant);
+
+// Roles que esta API puede asignar. 'superadmin' y 'dueño' jamás se otorgan desde aquí: evita que un
+// colaborador se promueva (en la empresa 1, 'superadmin' equivale a controlar toda la plataforma).
+function resolverRol(solicitante: any, solicitado: unknown): string | null {
+  if (solicitado === undefined || solicitado === null || solicitado === "" || solicitado === "cajero") return "cajero";
+  const esPropietario = ["superadmin", "dueño", "admin"].includes(solicitante?.role);
+  if (solicitado === "admin" && esPropietario) return "admin";
+  return null;
+}
 
 // Listar cajeros
 router.get("/", (req: any, res: any) => {
@@ -24,7 +33,7 @@ router.get("/", (req: any, res: any) => {
 });
 
 // Crear cajero y usuario asociado
-router.post("/", async (req: any, res: any) => {
+router.post("/", verifyPermission("recursos_humanos"), async (req: any, res: any) => {
   const empresa_id = req.user.empresa_id;
   const { nombre, documento, telefono, direccion, fecha_contrato, salario, paga_comisiones, porcentaje_comision_base, meta_comision, porcentaje_comision_meta, username, password, permisos } = req.body;
   if (!nombre) return res.status(400).json({ error: "Nombre es requerido" });
@@ -73,18 +82,28 @@ router.post("/", async (req: any, res: any) => {
 });
 
 // Actualizar cajero y usuario
-router.put("/:id", async (req: any, res: any) => {
+router.put("/:id", verifyPermission("recursos_humanos"), async (req: any, res: any) => {
   const empresa_id = req.user.empresa_id;
   const { nombre, documento, telefono, direccion, fecha_contrato, salario, paga_comisiones, porcentaje_comision_base, meta_comision, porcentaje_comision_meta, username, password, permisos } = req.body;
   const cajero_id = req.params.id;
 
   if (!nombre) return res.status(400).json({ error: "Nombre es requerido" });
 
+  const rol = resolverRol(req.user, req.body.role);
+  if (rol === null) return res.status(403).json({ error: "No tienes permiso para asignar ese rol." });
+
   const promisePool = connection.promise();
   const conn = await promisePool.getConnection();
 
   try {
     await conn.beginTransaction();
+
+    // 0. El colaborador debe pertenecer a la empresa autenticada (evita tocar usuarios de otra empresa por id)
+    const [propio]: any = await conn.query("SELECT id FROM cajeros WHERE id = ? AND empresa_id = ?", [cajero_id, empresa_id]);
+    if (propio.length === 0) {
+      await conn.rollback();
+      return res.status(404).json({ error: "Vendedor no encontrado." });
+    }
 
     // 1. Actualizar cajero
     const query = `
@@ -108,13 +127,13 @@ router.put("/:id", async (req: any, res: any) => {
     const permisosStr = permisos ? (typeof permisos === 'string' ? permisos : JSON.stringify(permisos)) : null;
     
     // Buscar si ya tiene usuario
-    const [users]: any = await conn.query("SELECT id FROM usuarios_plataforma WHERE cajero_id = ?", [cajero_id]);
+    const [users]: any = await conn.query("SELECT id FROM usuarios_plataforma WHERE cajero_id = ? AND empresa_id = ?", [cajero_id, empresa_id]);
     
     if (users.length > 0) {
       if (username) {
         // Update existing user
         let updateQuery = "UPDATE usuarios_plataforma SET username = ?, permisos = ?, role = ?";
-        let params = [username, permisosStr, req.body.role || 'cajero'];
+        let params = [username, permisosStr, rol];
         
         if (password) {
           const salt = await bcrypt.genSalt(10);
@@ -123,8 +142,8 @@ router.put("/:id", async (req: any, res: any) => {
           params.push(hash);
         }
         
-        updateQuery += " WHERE cajero_id = ?";
-        params.push(cajero_id as any);
+        updateQuery += " WHERE cajero_id = ? AND empresa_id = ?";
+        params.push(cajero_id as any, empresa_id);
         await conn.query(updateQuery, params);
       }
     } else if (username && password) {
@@ -133,7 +152,7 @@ router.put("/:id", async (req: any, res: any) => {
       const hash = await bcrypt.hash(password, salt);
       await conn.query(
         "INSERT INTO usuarios_plataforma (empresa_id, username, password_hash, role, cajero_id, permisos) VALUES (?, ?, ?, ?, ?, ?)",
-        [empresa_id, username, hash, req.body.role || 'cajero', cajero_id, permisosStr]
+        [empresa_id, username, hash, rol, cajero_id, permisosStr]
       );
     }
 
@@ -149,7 +168,7 @@ router.put("/:id", async (req: any, res: any) => {
 });
 
 // Eliminar cajero
-router.delete("/:id", async (req: any, res: any) => {
+router.delete("/:id", verifyPermission("recursos_humanos"), async (req: any, res: any) => {
   const empresa_id = req.user.empresa_id;
   const cajero_id = req.params.id;
 
@@ -159,8 +178,15 @@ router.delete("/:id", async (req: any, res: any) => {
   try {
     await conn.beginTransaction();
 
+    // El colaborador debe pertenecer a la empresa autenticada antes de tocar su usuario asociado
+    const [propio]: any = await conn.query("SELECT id FROM cajeros WHERE id = ? AND empresa_id = ?", [cajero_id, empresa_id]);
+    if (propio.length === 0) {
+      await conn.rollback();
+      return res.status(404).json({ error: "Vendedor no encontrado." });
+    }
+
     // Eliminar usuario asociado primero por el FK
-    await conn.query("DELETE FROM usuarios_plataforma WHERE cajero_id = ?", [cajero_id]);
+    await conn.query("DELETE FROM usuarios_plataforma WHERE cajero_id = ? AND empresa_id = ?", [cajero_id, empresa_id]);
     // Eliminar cajero
     const [result]: any = await conn.query("DELETE FROM cajeros WHERE id = ? AND empresa_id = ?", [cajero_id, empresa_id]);
     

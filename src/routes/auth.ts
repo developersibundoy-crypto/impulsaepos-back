@@ -117,6 +117,12 @@ router.post("/registro", verifyTokenAndTenant, async (req: any, res: any) => {
 
   if (!username || !password || !empresa_id) return res.status(400).json({ error: "Faltan datos" });
 
+  // Roles asignables: nunca 'superadmin' ni 'dueño' desde esta API (evita la escalada de privilegios).
+  const rolSolicitado = role === undefined || role === null || role === "" ? "cajero" : role;
+  if (rolSolicitado !== "cajero" && rolSolicitado !== "admin") {
+    return res.status(403).json({ error: "No tienes permiso para asignar ese rol." });
+  }
+
   connection.query("SELECT * FROM usuarios_plataforma WHERE username = ?", [username], async (err: any, results: any[]) => {
     if (err) return res.status(500).json({ error: "BD Error" });
     if (results.length > 0) return res.status(409).json({ error: "Usuario existe" });
@@ -126,7 +132,7 @@ router.post("/registro", verifyTokenAndTenant, async (req: any, res: any) => {
       const hash = await bcrypt.hash(password, salt);
       connection.query(
         "INSERT INTO usuarios_plataforma (empresa_id, username, password_hash, role) VALUES (?, ?, ?, ?)",
-        [empresa_id, username, hash, role || 'cajero'],
+        [empresa_id, username, hash, rolSolicitado],
         (insertErr: any) => {
           if (insertErr) return res.status(500).json({ error: "Error de servidor al guardar cajero" });
           res.status(201).json({ success: true });
