@@ -57,16 +57,27 @@ export interface ReferenciaPago {
   /** Días declarados en la referencia (solo formato nuevo). Se contrasta con el importe, no se confía en él. */
   diasDeclarados: number | null;
   feDeclarada: boolean;
+  esTienda?: boolean;
 }
 
 /**
  * Formatos que emite el frontend actual:
- *  - SUB_<30|180|365>[_FE]_<empresa>_<timestamp>   (PricingPlans)
- *  - SUB_<empresa>_<timestamp>                       (Dashboard, formato antiguo)
+ *  - SUB_TIENDA_<30|180|365>_<empresa>_<timestamp> (Tienda Online Add-on)
+ *  - SUB_TIENDA_<empresa>_<timestamp>               (Tienda Online Add-on 30 días)
+ *  - SUB_<30|180|365>[_FE]_<empresa>_<timestamp>   (PricingPlans POS)
+ *  - SUB_<empresa>_<timestamp>                       (Dashboard POS, formato antiguo)
  *  - SUB_LOGIN_<empresa>_<timestamp>                 (renovación desde el login)
  */
 export function parsearReferencia(referencia: unknown): ReferenciaPago | null {
   if (typeof referencia !== "string" || referencia.length > 100) return null;
+  
+  // 1. Complemento Tienda Online ($70.000 COP / mes)
+  let mTienda = /^SUB_TIENDA_(30|180|365)_(\d{1,9})_(\d{10,15})$/.exec(referencia);
+  if (mTienda) return { empresaId: Number(mTienda[2]), diasDeclarados: Number(mTienda[1]), feDeclarada: false, esTienda: true };
+  mTienda = /^SUB_TIENDA_(\d{1,9})_(\d{10,15})$/.exec(referencia);
+  if (mTienda) return { empresaId: Number(mTienda[1]), diasDeclarados: 30, feDeclarada: false, esTienda: true };
+
+  // 2. Suscripción POS Base
   let m = /^SUB_(30|180|365)(_FE)?_(\d{1,9})_(\d{10,15})$/.exec(referencia);
   if (m) return { empresaId: Number(m[3]), diasDeclarados: Number(m[1]), feDeclarada: Boolean(m[2]) };
   m = /^SUB_LOGIN_(\d{1,9})_(\d{10,15})$/.exec(referencia) || /^SUB_(\d{1,9})_(\d{10,15})$/.exec(referencia);
@@ -82,6 +93,16 @@ export interface PreciosPlan {
 
 // Planes con facturación electrónica: mismos importes que ofrece PricingPlans.tsx.
 const PRECIOS_FE = { 30: 10000000, 180: 54000000, 365: 96000000 } as const;
+
+// Precios oficiales complemento Tienda Online: $70.000 COP / mes
+export const PRECIOS_TIENDA = { 30: 7000000, 180: 37800000, 365: 71400000 } as const;
+
+export function resolverPlanTienda(montoCentavos: number): { dias: number } | null {
+  if (montoCentavos === PRECIOS_TIENDA[30]) return { dias: 30 };
+  if (montoCentavos === PRECIOS_TIENDA[180]) return { dias: 180 };
+  if (montoCentavos === PRECIOS_TIENDA[365]) return { dias: 365 };
+  return null;
+}
 
 /** Resuelve el plan por el importe pagado (centavos). Los días jamás se toman de la referencia. */
 export function resolverPlan(montoCentavos: number, precios: PreciosPlan): { dias: number; fe: boolean } | null {

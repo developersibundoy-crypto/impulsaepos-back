@@ -5,7 +5,8 @@ const {
   checksumEsperado,
   firmaValida,
   parsearReferencia,
-  resolverPlan
+  resolverPlan,
+  resolverPlanTienda
 } = require('../../dist/services/wompiEventos');
 
 async function testWompiService() {
@@ -56,6 +57,13 @@ async function testWompiService() {
   const refLogin = parsearReferencia('SUB_LOGIN_7_1732000000');
   assert.deepStrictEqual(refLogin, { empresaId: 7, diasDeclarados: null, feDeclarada: false });
 
+  // Referencias de suscripción de Tienda Online
+  const refTienda30 = parsearReferencia('SUB_TIENDA_30_8_1732000000');
+  assert.deepStrictEqual(refTienda30, { empresaId: 8, diasDeclarados: 30, feDeclarada: false, esTienda: true });
+
+  const refTiendaSimple = parsearReferencia('SUB_TIENDA_8_1732000000');
+  assert.deepStrictEqual(refTiendaSimple, { empresaId: 8, diasDeclarados: 30, feDeclarada: false, esTienda: true });
+
   const refInvalida = parsearReferencia('MALICIOSO_1_2');
   assert.strictEqual(refInvalida, null, 'Referencias desconocidas deben retornar null');
 
@@ -69,6 +77,13 @@ async function testWompiService() {
 
   const pInvalido = resolverPlan(123456, precios);
   assert.strictEqual(pInvalido, null, 'Montos extraños no deben asociarse a planes');
+
+  // 7. Resolución de plan de Tienda Online ($70.000 COP / mes = 7.000.000 centavos)
+  const pTienda = resolverPlanTienda(7000000);
+  assert.deepStrictEqual(pTienda, { dias: 30 });
+
+  const pTiendaInvalido = resolverPlanTienda(5000000);
+  assert.strictEqual(pTiendaInvalido, null);
 
   console.log('✅ [TEST] WompiEventos: Todas las aserciones pasaron correctamente.');
 }

@@ -1,5 +1,5 @@
 import type { Pool } from "mysql2/promise";
-import { parsearReferencia, resolverPlan, PreciosPlan } from "./wompiEventos";
+import { parsearReferencia, resolverPlan, resolverPlanTienda, PreciosPlan } from "./wompiEventos";
 
 export interface PagoAprobado {
   proveedor: "wompi";
@@ -49,17 +49,28 @@ export async function registrarPagoAprobado(
     let estado: "aplicado" | "conciliar" = "aplicado";
     let motivo: string | null = null;
 
-    const plan = resolverPlan(pago.montoCentavos, precios);
     if (!ref) {
       estado = "conciliar"; motivo = "referencia no reconocida";
     } else if (pago.moneda !== "COP") {
       estado = "conciliar"; motivo = "moneda distinta de COP";
-    } else if (!plan) {
-      estado = "conciliar"; motivo = "importe no corresponde a ningún plan";
-    } else if (ref.diasDeclarados !== null && (ref.diasDeclarados !== plan.dias || ref.feDeclarada !== plan.fe)) {
-      estado = "conciliar"; motivo = "la referencia contradice el importe pagado";
+    } else if (ref.esTienda) {
+      const planTienda = resolverPlanTienda(pago.montoCentavos);
+      if (!planTienda) {
+        estado = "conciliar"; motivo = "importe no corresponde a plan de tienda online";
+      } else if (ref.diasDeclarados !== null && ref.diasDeclarados !== planTienda.dias) {
+        estado = "conciliar"; motivo = "la referencia de tienda contradice el importe pagado";
+      } else {
+        dias = planTienda.dias;
+      }
     } else {
-      dias = plan.dias;
+      const plan = resolverPlan(pago.montoCentavos, precios);
+      if (!plan) {
+        estado = "conciliar"; motivo = "importe no corresponde a ningún plan";
+      } else if (ref.diasDeclarados !== null && (ref.diasDeclarados !== plan.dias || ref.feDeclarada !== plan.fe)) {
+        estado = "conciliar"; motivo = "la referencia contradice el importe pagado";
+      } else {
+        dias = plan.dias;
+      }
     }
 
     if (estado === "aplicado" && empresaId !== null) {
@@ -93,12 +104,54 @@ export async function registrarPagoAprobado(
       return { estado: "conciliar", motivo: motivo || "requiere revisión" };
     }
 
-    await conn.query(
-      "INSERT INTO pagos_suscripcion (empresa_id, wompi_transaction_id, monto, dias_agregados, metodo_pago) VALUES (?, ?, ?, ?, 'Wompi')",
-      [empresaId, pago.eventoId, pago.montoCentavos / 100, dias]
-    );
-    const [upd]: any = await conn.query(SQL_EXTENDER_SUSCRIPCION, [dias, dias, empresaId]);
-    if (upd.affectedRows !== 1) throw new Error("No se pudo extender la suscripción");
+    if (ref?.esTienda) {
+      // Extensión / Contratación de Tienda Online ($70.000 COP / mes)
+      const [tiendaRow]: any = await conn.query(
+        "SELECT id FROM tiendas WHERE empresa_id = ?",
+        [empresaId]
+      );
+      if (tiendaRow.length === 0) {
+        await conn.query(
+          "INSERT INTO tiendas (empresa_id, slug, nombre, estado) VALUES (?, CONCAT('tienda-', ?), CONCAT('Tienda ', ?), 'borrador')",
+          [empresaId, empresaId, empresaId]
+        );
+      }
+
+      // Obtener última fecha de vencimiento vigente
+      const [ultContrato]: any = await conn.query(
+        "SELECT vence_en FROM tienda_contrataciones WHERE empresa_id = ? AND estado = 'vigente' ORDER BY vence_en DESC LIMIT 1 FOR UPDATE",
+        [empresaId]
+      );
+
+      let venceEnStr: string;
+      if (ultContrato.length > 0 && new Date(ultContrato[0].vence_en) >= new Date()) {
+        const [calcDate]: any = await conn.query("SELECT DATE_ADD(?, INTERVAL ? DAY) as nueva_fecha", [ultContrato[0].vence_en, dias]);
+        venceEnStr = calcDate[0].nueva_fecha;
+      } else {
+        const [calcDate]: any = await conn.query("SELECT DATE_ADD(CURRENT_DATE(), INTERVAL ? DAY) as nueva_fecha", [dias]);
+        venceEnStr = calcDate[0].nueva_fecha;
+      }
+
+      await conn.query(
+        `INSERT INTO tienda_contrataciones (empresa_id, desde, vence_en, estado, origen, referencia, monto_centavos)
+         VALUES (?, CURRENT_DATE(), ?, 'vigente', 'suscripcion', ?, ?)`,
+        [empresaId, venceEnStr, String(pago.referencia ?? "").slice(0, 100), pago.montoCentavos]
+      );
+
+      await conn.query(
+        `INSERT INTO tienda_auditoria (empresa_id, entidad, accion, actor_tipo, actor_id, detalle)
+         VALUES (?, 'contratacion', 'pago_suscripcion_wompi', 'wompi', NULL, ?)`,
+        [empresaId, JSON.stringify({ dias, montoCentavos: pago.montoCentavos, transaccionId: pago.eventoId })]
+      );
+    } else {
+      // Flujo Suscripción POS Estándar
+      await conn.query(
+        "INSERT INTO pagos_suscripcion (empresa_id, wompi_transaction_id, monto, dias_agregados, metodo_pago) VALUES (?, ?, ?, ?, 'Wompi')",
+        [empresaId, pago.eventoId, pago.montoCentavos / 100, dias]
+      );
+      const [upd]: any = await conn.query(SQL_EXTENDER_SUSCRIPCION, [dias, dias, empresaId]);
+      if (upd.affectedRows !== 1) throw new Error("No se pudo extender la suscripción");
+    }
 
     await conn.commit();
     return { estado: "aplicado", empresaId, dias };

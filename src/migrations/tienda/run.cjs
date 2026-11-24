@@ -48,6 +48,7 @@ function readTarget(env) {
     user: env.DB_USER,
     password: env.DB_PASSWORD ?? '',
     database: env.DB_NAME,
+    ...(env.DB_TLS_VERIFY === '1' ? {ssl:{rejectUnauthorized:true,verifyIdentity:true}} : {}),
   };
   for (const key of ['host', 'user', 'database']) {
     if (!target[key]) throw new Error(`Falta DB_${key === 'database' ? 'NAME' : key.toUpperCase()} en el entorno`);
