@@ -1,12 +1,22 @@
 import 'dotenv/config';
 import mysql from "mysql2";
 
+const staging = process.env.DB_PROFILE === 'staging';
+const prefix = staging ? 'STAGING_DB_' : 'DB_';
+const valor = (campo: string) => process.env[prefix + campo];
+if (staging && (valor('NAME') !== 'u311745467_STAGING_DB' ||
+    ['HOST','PORT','USER','PASSWORD'].some(c => !valor(c)))) {
+  throw new Error('[BD] Perfil staging incompleto o base distinta de u311745467_STAGING_DB.');
+}
+const host = valor('HOST') || "127.0.0.1";
+const database = valor('NAME') || "tienda_db";
+const port = Number(valor('PORT') || 3306);
+console.info(`[BD] perfil=${staging ? 'staging' : 'DB_*'} destino=${host}:${port}/${database}`);
 const pool = mysql.createPool({
-  host: process.env.DB_HOST || "127.0.0.1",
-  user: process.env.DB_USER || "root",
-  password: process.env.DB_PASSWORD || "",
-  database: process.env.DB_NAME || "tienda_db",
-  port: Number(process.env.DB_PORT) || 3306,
+  host, database, port,
+  user: valor('USER') || "root",
+  password: valor('PASSWORD') || "",
+  ...(staging ? {ssl:{rejectUnauthorized:true,verifyIdentity:true}} : {}),
   waitForConnections: true,
   connectionLimit: 10,
   queueLimit: 0,
@@ -27,15 +37,7 @@ pool.on('connection', (connection: any) => {
 // Test connection
 pool.getConnection((err, connection) => {
   if (err) {
-    if (err.code === 'PROTOCOL_CONNECTION_LOST') {
-      console.error('Database connection was closed.');
-    }
-    if (err.code === 'ER_CON_COUNT_ERROR') {
-      console.error('Database has too many connections.');
-    }
-    if (err.code === 'ECONNREFUSED') {
-      console.error('Database connection was refused.');
-    }
+    console.error(`[BD] conexión fallida: ${err.code || 'ERROR_DB'} (${host}:${port}/${database})`);
   } else {
     console.log("Conectado exitosamente al Pool de MySQL");
   }

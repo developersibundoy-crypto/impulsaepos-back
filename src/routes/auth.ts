@@ -151,12 +151,21 @@ router.post("/login", (req: any, res: any) => {
     "SELECT u.*, e.estado as estado_empresa, e.fecha_vencimiento_suscripcion, e.nombre_comercial FROM usuarios_plataforma u LEFT JOIN empresas_suscritas e ON u.empresa_id = e.id WHERE u.username = ?",
     [username],
     async (err: any, results: any[]) => {
-      if (err) return res.status(500).json({ error: "Error de conexion a la base de datos" });
-      if (results.length === 0) return res.status(401).json({ error: "Credenciales inválidas" });
+      if (err) {
+        console.error(`[AUTH] consulta de login fallida: ${err.code || 'ERROR_DB'}`);
+        return res.status(500).json({ error: "Error de conexion a la base de datos" });
+      }
+      if (results.length === 0) {
+        if(process.env.DB_PROFILE === 'staging') console.info('[AUTH staging] consulta OK; usuario no encontrado');
+        return res.status(401).json({ error: "Credenciales inválidas" });
+      }
 
       const admin = results[0];
       const validPassword = await bcrypt.compare(password, admin.password_hash);
-      if (!validPassword) return res.status(401).json({ error: "Credenciales inválidas" });
+      if (!validPassword) {
+        if(process.env.DB_PROFILE === 'staging') console.info('[AUTH staging] consulta OK; contraseña no coincide');
+        return res.status(401).json({ error: "Credenciales inválidas" });
+      }
 
       const hoy = new Date();
       const fecVen = new Date(admin.fecha_vencimiento_suscripcion);
